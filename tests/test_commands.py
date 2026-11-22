@@ -17,13 +17,21 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.connect_sensors.const import CONF_HEARTBEAT, DOMAIN
 from custom_components.connect_sensors.server import NetworkServer
 
-from .common import answer, full_state, pair, uplink_answered, uplink_unanswered
-from .conftest import DEV_EUI, K_ROOT, WallClock, state_of
+from .common import (
+    answer,
+    full_state,
+    pair,
+    parse_commands,
+    uplink_answered,
+    uplink_unanswered,
+)
+from .conftest import DEV_EUI, K_ROOT, Clock, WallClock, state_of
 from .sim import SimProxy, SimSensor
 
 COMMAND = "sensor.front_door_command"
 DOOR = "binary_sensor.front_door_door"
 SET_HEARTBEAT_2 = (cs.CMD_SET_HEARTBEAT, b"\x00\x02")
+RETRY_MS = 5_000  # a sensor's first retry comes 4-6 s after the original (08 section 5)
 
 
 def device_id(hass: HomeAssistant, entry: MockConfigEntry) -> str:
@@ -350,3 +358,70 @@ async def test_longer_heartbeat_not_unreachable(
     # Past 3 x 30 + 5 minutes, still within 3 x 120 + 5.
     await wall.advance(timedelta(minutes=120))
     assert state_of(hass, DOOR).state == STATE_OFF
+
+
+async def test_two_answers_keep_common_commands(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    clock: Clock,
+) -> None:
+    """Answers to an uplink and to its retransmission carry different commands: DL_ACK
+    delivers only those both carried (07 section 7)."""
+    await proxy.connect()
+    server = server_of(loaded)
+    await pair(hass, proxy, sensor)
+    device = server.devices[DEV_EUI]
+    await set_heartbeat(hass, loaded, 2)
+    frame = sensor.uplink(cs.T_DATA_CONFIRMED, cs.encode_reading(0, 0x01, 1))
+    first = parse_commands(sensor_view(sensor, await answer(proxy, proxy.uplink(frame))))
+    assert first == [SET_HEARTBEAT_2]
+
+    # A command is queued before the sensor retries; its answer carries both.
+    value = cs.encode_reading(1, 0x40, 2000)
+    assert await server.async_queue(device, "set_value", "value_1", 0x40, value)
+    clock.advance(RETRY_MS)
+    second = sensor.downlink(await answer(proxy, proxy.uplink(frame)))
+    assert parse_commands(second["commands"]) == [SET_HEARTBEAT_2, (0x40, value)]
+
+    # The sensor took one of the two answers, not known which: only SET_HEARTBEAT
+    # is delivered, and SET_VALUE goes out again.
+    dl = await uplink_answered(hass, proxy, sensor, uflags=cs.UF_DL_ACK)
+    assert dl["parsed"] == [(0x40, value)]
+    assert [c.name for c in device.commands] == ["set_value"]
+    assert state_of(hass, COMMAND).attributes["last_command"] == "set_heartbeat"
+    await uplink_unanswered(hass, proxy, sensor, uflags=cs.UF_DL_ACK)
+    assert device.commands == []
+
+
+async def test_no_commands_for_late_arrivals(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+) -> None:
+    """An answer to a late arrival carries no commands (07 section 7), and does not
+    move the commands' acknowledgement back to it."""
+    await proxy.connect()
+    server = server_of(loaded)
+    await pair(hass, proxy, sensor)
+    late = sensor.uplink(cs.T_DATA_CONFIRMED, cs.encode_reading(0, 0x01, 1))
+    await set_heartbeat(hass, loaded, 2)
+    dl = await uplink_answered(hass, proxy, sensor)
+    assert dl["parsed"] == [SET_HEARTBEAT_2]
+    reply_to = dl["reply_to"]
+
+    # The earlier confirmed frame arrives late: answered, without the command.
+    commands = sensor_view(sensor, await answer(proxy, proxy.uplink(late)))
+    assert commands == b""
+    assert server.devices[DEV_EUI].acks.reply_to == reply_to
+
+    await uplink_unanswered(hass, proxy, sensor, uflags=cs.UF_DL_ACK)
+    assert state_of(hass, COMMAND).state == "delivered"
+
+
+def sensor_view(sensor: SimSensor, frame: bytes) -> bytes:
+    """The commands of a session downlink, without the sensor accepting it."""
+    _, pt = cs.open_frame(sensor.session, frame)
+    return pt[9:]

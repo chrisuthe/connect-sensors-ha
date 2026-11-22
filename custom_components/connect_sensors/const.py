@@ -50,7 +50,7 @@ RESERVE_BLOCK: Final = 64
 SAVE_DELAY_S: Final = 10
 
 # Spec 07 section 6.2: a proxy's timing record disqualifies it from RX1.
-RX1_MAX_OFFSET_US: Final = 80_000
+RX1_MAX_OFFSET_US: Final = 30_000
 RX1_MAX_LATE_OR_BUSY: Final = 2
 SNR_TIE_DB: Final = 1.0
 

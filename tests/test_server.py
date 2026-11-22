@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 import json
 import struct
@@ -37,6 +38,7 @@ from .sim import SimProxy, SimSensor, downlink_body
 DOOR = "binary_sensor.front_door_door"
 PAIRING = "sensor.front_door_pairing"
 RETRY_MS = 5_000  # a sensor's first retry comes 4-6 s after the original (08 section 5)
+SENT, BUSY = 0, 2
 
 
 async def test_proxy_session(
@@ -216,6 +218,75 @@ async def test_pairing_stalled(
     assert state_of(hass, PAIRING).state == "exchanged"
 
 
+async def test_new_join_while_exchanged(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+) -> None:
+    """A sensor restarted mid-pairing sends a JOIN with a new key: in EXCHANGED it is
+    identified and answered with a new exchange (04 section 4.2), and pairing completes."""
+    await proxy.connect()
+    rx = proxy.uplink(sensor.join())
+    first = await answer(proxy, rx)
+    await hass.async_block_till_done()
+    assert state_of(hass, PAIRING).state == "exchanged"
+
+    # The sensor restarts before it hears the answer, and the user presses the button.
+    rx = proxy.uplink(sensor.join())
+    second = await answer(proxy, rx)
+    assert second != first
+    root = cs.keys_from(bytes.fromhex(K_ROOT), bytes.fromhex(DEV_EUI))
+    assert cs.open_frame(root, second)[0].fcnt == 2
+    assert sensor.key_exchange(second) == "accept"
+    await hass.async_block_till_done()
+    assert state_of(hass, PAIRING).state == "exchanged"
+
+    rx = proxy.uplink(sensor.sync())
+    assert sensor.downlink(await answer(proxy, rx))["commands"][0] == cs.CMD_SET_NETWORK
+    rx = proxy.uplink(sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0), cs.UF_DL_ACK))
+    sensor.downlink(await answer(proxy, rx))
+    await hass.async_block_till_done()
+    assert state_of(hass, PAIRING).state == "paired"
+
+
+async def test_stall_counts_after_sent(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    clock: Clock,
+) -> None:
+    """JOIN retransmissions count toward the stall only once a KEY_EXCHANGE was
+    reported SENT (07 section 5.1)."""
+    await proxy.connect()
+    # Every transmission of the first exchange fails: its retries do not count.
+    proxy.tx_result = (BUSY, 0)
+    join = sensor.join()
+    for _ in range(4):
+        await join_answered(proxy, join, clock)
+    await hass.async_block_till_done()
+    assert state_of(hass, PAIRING).state == "exchanged"
+
+    # The sensor gives up and the user presses again: this exchange goes out.
+    proxy.tx_result = (SENT, 1800)
+    join = sensor.join()
+    for _ in range(4):
+        await join_answered(proxy, join, clock)
+    await hass.async_block_till_done()
+    assert state_of(hass, PAIRING).state == "stalled"
+
+
+async def join_answered(proxy: SimProxy, join: bytes, clock: Clock) -> None:
+    """Send a JOIN and take every DOWNLINK answering it (RX1, RX2 after a failure)."""
+    proxy.uplink(join)
+    await proxy.recv(cs.M_DOWNLINK)
+    await asyncio.sleep(0.3)
+    while not proxy.inbox.empty():
+        proxy.inbox.get_nowait()
+    clock.advance(RETRY_MS)
+
+
 async def test_restart_restores_state(
     hass: HomeAssistant,
     loaded: MockConfigEntry,
@@ -360,8 +431,7 @@ async def test_start_from_storage(
     await hass.async_block_till_done()
     assert state_of(hass, DOOR).state == STATE_ON
 
-    untyped: Any = sensor.pairing
-    untyped.k_session = k_session
+    sensor.pairing.k_session = k_session
     sensor.k_net_route = cs.derive_net_route(bytes.fromhex(K_NET))
     sensor.server_time = int(time.time())
     await proxy.connect()

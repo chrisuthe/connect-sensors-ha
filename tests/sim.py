@@ -1,9 +1,4 @@
-"""A simulated proxy (over real UDP) and a simulated sensor, built on connectsensors.
-
-The proxy and sensor sides of the protocol (ProxyLink, SensorPairing) are in the
-package but not in its public API yet (chrisuthe/ConnectSensors#54), so they come from
-connectsensors._csframe.
-"""
+"""A simulated proxy (over real UDP) and a simulated sensor, built on connectsensors."""
 
 from __future__ import annotations
 
@@ -13,7 +8,6 @@ import time
 from typing import Any
 
 import connectsensors as cs
-from connectsensors._csframe import ProxyLink, SensorPairing
 
 COUNTERS = [10, 9, 1, 0, 0, 2, 0]
 # EU868 has no frequency yet: 865.2 MHz is the candidate in spec 01 section 3.2.
@@ -45,7 +39,7 @@ class SimProxy(asyncio.DatagramProtocol):
         self.proxy_id = proxy_id
         self.server_port = server_port
         self.boot_id = boot_id
-        self.link = ProxyLink(boot_id)
+        self.link = cs.ProxyLink(boot_id)
         self.seq = 0
         self.inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.transport: asyncio.DatagramTransport | None = None
@@ -142,7 +136,7 @@ class SimSensor:
 
     def __init__(self, k_root: bytes, dev_eui: bytes) -> None:
         self.dev_eui = dev_eui
-        self.pairing = SensorPairing(k_root, dev_eui)
+        self.pairing = cs.SensorPairing(k_root, dev_eui)
         self.fcnt = 200
         self.k_net_route: bytes | None = None
         self.server_time = 0
@@ -152,10 +146,8 @@ class SimSensor:
     @property
     def k_session(self) -> bytes:
         """The session key, once KEY_EXCHANGE was accepted."""
-        # SensorPairing.k_session is unannotated, so type checkers see it as always None.
-        pairing: Any = self.pairing
-        assert pairing.k_session is not None
-        return bytes(pairing.k_session)
+        assert self.pairing.k_session is not None
+        return self.pairing.k_session
 
     @property
     def session(self) -> cs.DeviceKeys:
@@ -166,11 +158,11 @@ class SimSensor:
         """A JOIN with a fresh ephemeral key (02 section 11.1)."""
         self.fcnt += 1
         self._priv += 1
-        return bytes(self.pairing.join(self.fcnt, bytes([self._priv]) * 32))
+        return self.pairing.join(self.fcnt, bytes([self._priv]) * 32)
 
     def key_exchange(self, frame: bytes) -> str:
         """Take the server's answer to JOIN; a new k_session resets the session floor."""
-        result = str(self.pairing.downlink(frame))
+        result = self.pairing.downlink(frame)
         if result == "accept":
             self.session_floor = 0
         return result
