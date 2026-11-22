@@ -204,7 +204,7 @@ async def test_timing_excludes_from_rx1(
 ) -> None:
     """A late SENT, more than 2 TOO_LATE or BUSY, or an uncertain timestamp: no RX1."""
     await paired(hass, proxies, sensor, via="c")
-    await record(proxies["a"], (SENT, 1800), (SENT, 90_000))
+    await record(proxies["a"], (SENT, 1800), (SENT, 31_000))
     await record(proxies["b"], (TOO_LATE, 0), (BUSY, 0), (BUSY, 0))
 
     rx = heard(proxies, confirmed(sensor), {"a": 10.0, "b": 9.0, "c": 1.0})
@@ -225,6 +225,21 @@ async def test_timing_excludes_from_rx1(
     await record(proxies["c"], (TOO_LATE, 0), (BUSY, 0))
     rx = heard(proxies, confirmed(sensor), {"a": 10.0, "c": 1.0})
     sensor.downlink(await downlink(proxies["c"], rx["c"], RX1))
+
+
+async def test_timing_threshold(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxies: dict[str, SimProxy],
+    sensor: SimSensor,
+) -> None:
+    """A SENT more than 30 ms late rules a proxy out of RX1; 29 ms does not (07 6.2)."""
+    await paired(hass, proxies, sensor, via="c")
+    await record(proxies["a"], (SENT, 29_000))
+    await record(proxies["b"], (SENT, 31_000))
+    rx = heard(proxies, confirmed(sensor), {"a": 1.0, "b": 10.0})
+    sensor.downlink(await downlink(proxies["a"], rx["a"], RX1))
+    await silent(proxies, "b", "c")
 
 
 async def test_rx2_after_failed_rx1(

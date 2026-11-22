@@ -70,6 +70,9 @@
       }
     },
     "proxy": {
+      "abort": {
+        "duplicate_key": "Another proxy was added with the same key meanwhile. Add this proxy again to get a key of its own."
+      },
       "entry_type": "Proxy",
       "initiate_flow": {
         "reconfigure": "Show configuration",
@@ -223,6 +226,20 @@
     "proxy_mismatch": {
       "description": "{name} uses {proxy_settings}, but the network uses {network_settings}. Home Assistant sends no downlinks through it, so devices only it hears cannot pair or get their acknowledgements.\n\nSet `region: {region}` in the proxy's ESPHome configuration and install it again. This issue clears when the proxy reports matching settings.",
       "title": "Proxy {name} uses other radio settings"
+    },
+    "shared_key": {
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "New key for {name}",
+            "description": "Another proxy holds the same key as {name}. Anyone with either proxy could use that key to make {name} transmit, so Home Assistant sends no downlinks through it.\n\nTo give {name} a key of its own, paste this into its ESPHome configuration and install it:\n\n```yaml\n{snippet}```\n\nWhen you submit, Home Assistant replaces the old key, and {name} is offline until it connects with this one."
+          }
+        },
+        "abort": {
+          "proxy_removed": "The proxy was removed."
+        }
+      },
+      "title": "Proxy {name} shares its key"
     },
     "single_path": {
       "description": "For more than a day, only {proxy} has heard {name}. If that proxy goes offline, Home Assistant loses the device.\n\nAdd a proxy within range of {name} to give it a second path. This issue clears once another proxy hears it.",

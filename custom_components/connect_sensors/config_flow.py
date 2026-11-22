@@ -15,7 +15,7 @@ from homeassistant.config_entries import (
     SubentryFlowResult,
 )
 from homeassistant.const import CONF_NAME, CONF_PORT
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
@@ -58,6 +58,37 @@ HEARTBEAT_SELECTOR = NumberSelector(
         unit_of_measurement="min",
     )
 )
+
+
+async def async_proxy_snippet(hass: HomeAssistant, entry: ConfigEntry, key: str) -> str:
+    """The cs_proxy configuration for a proxy with this key (06)."""
+    host = await async_get_source_ip(hass)
+    return (
+        "cs_proxy:\n"
+        "  radio_id: lora\n"
+        f"  region: {entry.data[CONF_REGION]}\n"
+        "  server:\n"
+        f"    host: {host}\n"
+        f"    port: {entry.data[CONF_PORT]}\n"
+        f'    key: "{key}"\n'
+    )
+
+
+def proxy_keys(entry: ConfigEntry) -> set[str]:
+    """The keys the network's proxies hold."""
+    return {
+        s.data[CONF_KEY].lower()
+        for s in entry.subentries.values()
+        if s.subentry_type == SUBENTRY_PROXY
+    }
+
+
+def new_proxy_key(entry: ConfigEntry) -> str:
+    """A key no proxy holds: a proxy that accepts downlinks needs its own (05 4.2)."""
+    used = proxy_keys(entry)
+    while (key := secrets.token_hex(16)) in used:
+        pass
+    return key
 
 
 class ConnectSensorsConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -122,34 +153,25 @@ class ProxySubentryFlow(ConfigSubentryFlow):
 
     _key: str | None = None
 
-    async def _snippet(self, key: str) -> str:
-        entry = self._get_entry()
-        host = await async_get_source_ip(self.hass)
-        return (
-            "cs_proxy:\n"
-            "  radio_id: lora\n"
-            f"  region: {entry.data[CONF_REGION]}\n"
-            "  server:\n"
-            f"    host: {host}\n"
-            f"    port: {entry.data[CONF_PORT]}\n"
-            f'    key: "{key}"\n'
-        )
-
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
         """Show the snippet; the proxy is added on submit."""
+        entry = self._get_entry()
         if self._key is None:
-            self._key = secrets.token_hex(16)
+            self._key = new_proxy_key(entry)
         if user_input is not None:
+            # Another flow may have added a proxy with this key meanwhile.
+            if self._key in proxy_keys(entry):
+                return self.async_abort(reason="duplicate_key")
             return self.async_create_entry(title=user_input[CONF_NAME], data={CONF_KEY: self._key})
-        count = sum(
-            1 for s in self._get_entry().subentries.values() if s.subentry_type == SUBENTRY_PROXY
-        )
+        count = sum(1 for s in entry.subentries.values() if s.subentry_type == SUBENTRY_PROXY)
         return self.async_show_form(
             step_id="user",
             data_schema=probatio.Schema(
                 {probatio.Required(CONF_NAME, default=f"Proxy {count + 1}"): str}
             ),
-            description_placeholders={"snippet": await self._snippet(self._key)},
+            description_placeholders={
+                "snippet": await async_proxy_snippet(self.hass, entry, self._key)
+            },
         )
 
     async def async_step_reconfigure(
@@ -166,7 +188,11 @@ class ProxySubentryFlow(ConfigSubentryFlow):
             data_schema=probatio.Schema(
                 {probatio.Required(CONF_NAME, default=subentry.title): str}
             ),
-            description_placeholders={"snippet": await self._snippet(subentry.data[CONF_KEY])},
+            description_placeholders={
+                "snippet": await async_proxy_snippet(
+                    self.hass, self._get_entry(), subentry.data[CONF_KEY]
+                )
+            },
         )
 
 

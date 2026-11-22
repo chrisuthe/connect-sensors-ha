@@ -10,7 +10,7 @@ Pairing codes, keys and decrypted payloads are never logged (07 section 11.6).
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -18,7 +18,7 @@ import logging
 import secrets
 import struct
 import time
-from typing import Any, cast
+from typing import Any
 
 import connectsensors as cs
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
@@ -95,6 +95,7 @@ HOUR_MS = 3_600_000
 SINGLE_PATH_WINDOW = timedelta(hours=SINGLE_PATH_WINDOW_H)
 SINGLE_PATH_REPAIR = timedelta(hours=SINGLE_PATH_REPAIR_H)
 DEVICE_ISSUES = ("pairing_stalled", "device_unreachable", "single_path")
+PROXY_ISSUES = ("proxy_mismatch", "shared_key")
 COMMAND_EXPIRY = timedelta(hours=COMMAND_EXPIRY_H)
 LEAVE_EXPIRY = timedelta(hours=LEAVE_EXPIRY_H)
 
@@ -112,23 +113,6 @@ def _new_nonce() -> int:
     return secrets.randbits(32) or 1
 
 
-# connectsensors 0.1.0 leaves ServerLink.boot_id and JoinResponder.pending unannotated,
-# so type checkers see them as always None (chrisuthe/ConnectSensors#54).
-def _boot_id(link: cs.ServerLink) -> int | None:
-    untyped: Any = link
-    return cast(int | None, untyped.boot_id)
-
-
-def _pending(join: cs.JoinResponder) -> dict[str, Any] | None:
-    untyped: Any = join
-    return cast(dict[str, Any] | None, untyped.pending)
-
-
-def _set_pending(join: cs.JoinResponder, pending: dict[str, Any]) -> None:
-    untyped: Any = join
-    untyped.pending = pending
-
-
 def _radio(region: str, freq: int | None, sf: int, bw: int) -> str:
     mhz = f" {freq / 1e6:g} MHz" if freq is not None else ""
     return f"{region}{mhz} SF{sf} {bw} kHz"
@@ -143,6 +127,7 @@ class PendingDownlink:
     """A DOWNLINK waiting for its TX_RESULT; result is set if someone waits for it."""
 
     eui: str
+    frame: bytes
     result: asyncio.Future[str] | None
 
 
@@ -229,6 +214,8 @@ class Proxy:
         self.last_hello_ms: int | None = None
         self.last_hello: datetime | None = None
         self.radio_mismatch = False
+        # Another proxy holds the same key, so either could forge its DOWNLINKs.
+        self.shared = False
         self.uplinks = 0
         self.downlinks_sent = 0
         self.tx_results: deque[tuple[str, int]] = deque(maxlen=TX_HISTORY)
@@ -237,6 +224,15 @@ class Proxy:
         # Airtime of downlinks sent, by DOWNLINK seq: (sent at ms, airtime ms).
         self.airtime: dict[int, tuple[int, float]] = {}
         self.duty_cycle_until_ms: int | None = None
+
+    def rekey(self, key: bytes) -> None:
+        """Take a new key. The proxy_id stays bound (05 section 4.2): messages under the
+        old key are refused, and the proxy is offline until it connects with the new one."""
+        self.key = key
+        self.link = cs.ServerLink(_new_nonce)
+        self.addr = None
+        self.hello = None
+        self.last_hello_ms = None
 
     @property
     def proxy_id_hex(self) -> str | None:
@@ -259,6 +255,7 @@ class Proxy:
             and self.hello is not None
             and bool(self.hello["caps"] & cs.CAP_DOWNLINK)
             and not self.radio_mismatch
+            and not self.shared
             and self.addr is not None
         )
 
@@ -306,7 +303,8 @@ class Device:
         self.heartbeat_minutes: int = data.get(CONF_HEARTBEAT) or default_heartbeat(self.profile)
         k_root = bytes.fromhex(data[CONF_K_ROOT])
         self.root_keys = cs.keys_from(k_root, self.dev_eui)
-        self.join = cs.JoinResponder(k_root, self.dev_eui, root_fcnt_down)
+        # The pairing stall counts JOINs only after a KEY_EXCHANGE was SENT (07 5.1).
+        self.join = cs.JoinResponder(k_root, self.dev_eui, root_fcnt_down, count_after_sent=True)
         self.state = STATE_SCANNED
         self.k_session: bytes | None = None
         self.session_keys: cs.DeviceKeys | None = None
@@ -333,10 +331,10 @@ class Device:
         self.events: set[str] = set()
         # The first event of a new key, for its entity to show once it is added.
         self.first_events: dict[str, str] = {}
-        # Command queue (07 section 7), and the commands of the last downlink that
-        # carried any: (its reply_to, their ids), until the next uplink settles them.
+        # Command queue (07 section 7), and the ids of the commands awaiting
+        # acknowledgement, bound to their downlink's reply_to.
         self.commands: list[Command] = []
-        self.in_flight: tuple[int, list[int]] | None = None
+        self.acks = cs.CommandAcks[int]()
         self.next_command_id = 1
         self.last_command: dict[str, str] | None = None
         # Set while LEAVE is outstanding after the subentry was removed (04 section 6.1).
@@ -410,21 +408,14 @@ class Device:
 
     def to_store(self) -> dict[str, Any]:
         """The persisted record (07 section 2.2)."""
-        pending = _pending(self.join)
+        pending = self.join.pending
         return {
             "state": self.state,
             "k_session": self.k_session.hex() if self.k_session else None,
             "fcnt_down_reserved": self.fcnt_down_reserved,
             "last_fcnt": self.last_fcnt,
             "seen": sorted(self.uplinks.counter.seen),
-            "pending": None
-            if pending is None
-            else {
-                "sensor_pub": pending["sensor_pub"].hex(),
-                "frame": pending["frame"].hex(),
-                "k_session": pending["k_session"].hex(),
-                "retransmissions": pending["retransmissions"],
-            },
+            "pending": pending.to_dict() if pending is not None else None,
             "stalled": self.stalled,
             "readings": self.readings,
             "sw_version": self.sw_version,
@@ -439,7 +430,10 @@ class Device:
             else None,
             "events": sorted(self.events),
             "commands": [c.to_store() for c in self.commands],
-            "in_flight": list(self.in_flight) if self.in_flight else None,
+            # The awaiting-acknowledgement record, under its milestone 2 name.
+            "in_flight": [self.acks.reply_to, self.acks.awaiting]
+            if self.acks.reply_to is not None
+            else None,
             "next_command_id": self.next_command_id,
             "last_command": self.last_command,
         }
@@ -452,18 +446,16 @@ class Device:
             # Resume above every value that may have been used (02 section 8.2).
             self.fcnt_down_reserved = d["fcnt_down_reserved"]
             self.fcnt_down = max(0, self.fcnt_down_reserved - 1)
-        self.uplinks = cs.UplinkCollector(d["last_fcnt"])
-        self.uplinks.counter.seen = set(d["seen"])
-        if (p := d["pending"]) is not None:
-            _set_pending(
-                self.join,
-                {
-                    "sensor_pub": bytes.fromhex(p["sensor_pub"]),
-                    "frame": bytes.fromhex(p["frame"]),
-                    "k_session": bytes.fromhex(p["k_session"]),
-                    "retransmissions": p["retransmissions"],
-                },
-            )
+        self.uplinks = cs.UplinkCollector(d["last_fcnt"], d["seen"])
+        # Records from before 0.3.0 lack "sent"; from_dict counts their JOINs as before.
+        pending = cs.PendingExchange.from_dict(p) if (p := d["pending"]) is not None else None
+        self.join = cs.JoinResponder(
+            self.join.k_root,
+            self.dev_eui,
+            self.join.root_fcnt_down,
+            pending,
+            count_after_sent=True,
+        )
         self.stalled = d["stalled"]
         self.readings = d["readings"]
         self.sw_version = d["sw_version"]
@@ -480,8 +472,10 @@ class Device:
         # Added with commands and events.
         self.events = set(d.get("events", []))
         self.commands = [Command.from_store(c) for c in d.get("commands", [])]
-        if (flight := d.get("in_flight")) is not None:
-            self.in_flight = (flight[0], list(flight[1]))
+        flight = d.get("in_flight")
+        self.acks = cs.CommandAcks[int](
+            flight[0] if flight else None, flight[1] if flight else (), d["last_fcnt"]
+        )
         self.next_command_id = d.get("next_command_id", 1)
         self.last_command = d.get("last_command")
 
@@ -601,7 +595,8 @@ class NetworkServer(asyncio.DatagramProtocol):
             if proxy.proxy_id is not None:
                 self._by_proxy_id.pop(proxy.proxy_id, None)
             self._proxy_ids.pop(sid, None)
-            self._set_issue("proxy_mismatch", sid, None)
+            for issue in PROXY_ISSUES:
+                self._set_issue(issue, sid, None)
             for device in self.devices.values():
                 if device.heard_by.pop(sid, None) is not None:
                     async_dispatcher_send(self.hass, signal_device_update(device.eui))
@@ -620,6 +615,9 @@ class NetworkServer(asyncio.DatagramProtocol):
             if sub.subentry_type == SUBENTRY_PROXY:
                 if sid in self.proxies:
                     known_proxy = self.proxies[sid]
+                    if known_proxy.key != (key := bytes.fromhex(sub.data[CONF_KEY])):
+                        known_proxy.rekey(key)
+                        _LOGGER.info("Proxy %s has a new key", sub.title)
                     if known_proxy.name != sub.title:
                         known_proxy.name = sub.title
                         if known_proxy.proxy_id is not None:
@@ -649,7 +647,7 @@ class NetworkServer(asyncio.DatagramProtocol):
                     device.join = left.join
                     device.load_store(left.to_store())
                     device.commands = []
-                    device.in_flight = None
+                    device.acks = cs.CommandAcks[int](last_fcnt=device.last_fcnt)
                     _LOGGER.info(
                         "%s added again before it acknowledged LEAVE; LEAVE dropped", left.name
                     )
@@ -659,8 +657,30 @@ class NetworkServer(asyncio.DatagramProtocol):
                     self._rebuild_tags()
                 if not initial:
                     async_dispatcher_send(self.hass, SIGNAL_DEVICE_ADDED, device)
+        self._check_keys()
         if not initial:
             self._schedule_save()
+
+    @callback
+    def _check_keys(self) -> None:
+        """No downlinks through a proxy whose key another proxy holds (05 section 4.2,
+        07 section 6.1), and a repair for each that would accept them (07 11.5)."""
+        holders = Counter(p.key for p in self.proxies.values())
+        for proxy in self.proxies.values():
+            shared = holders[proxy.key] > 1
+            if shared and not proxy.shared:
+                _LOGGER.warning(
+                    "Proxy %s shares its key with another proxy; no downlinks go through it",
+                    proxy.name,
+                )
+            proxy.shared = shared
+            downlink = proxy.hello is not None and bool(proxy.hello["caps"] & cs.CAP_DOWNLINK)
+            self._set_issue(
+                "shared_key",
+                proxy.subentry_id,
+                {"name": proxy.name} if shared and downlink else None,
+                fix={"entry_id": self.entry.entry_id, "subentry_id": proxy.subentry_id},
+            )
 
     # ------------------------------------------------------------------ persistence
 
@@ -833,8 +853,15 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._set_issue("single_path", eui, single_path)
 
     @callback
-    def _set_issue(self, key: str, subject: str, placeholders: dict[str, str] | None) -> None:
-        """Raise issue `key` for a device or proxy with these placeholders, or clear it."""
+    def _set_issue(
+        self,
+        key: str,
+        subject: str,
+        placeholders: dict[str, str] | None,
+        fix: dict[str, str | int | float | None] | None = None,
+    ) -> None:
+        """Raise issue `key` for a device or proxy with these placeholders, or clear it.
+        With fix, the issue is fixable and its repair flow gets fix as its data."""
         issue_id = f"{key}_{subject}"
         if placeholders is None:
             self._issues.pop(issue_id, None)
@@ -848,7 +875,8 @@ class NetworkServer(asyncio.DatagramProtocol):
             self.hass,
             DOMAIN,
             issue_id,
-            is_fixable=False,
+            is_fixable=fix is not None,
+            data=fix,
             severity=ir.IssueSeverity.WARNING,
             translation_key=key,
             translation_placeholders=placeholders,
@@ -924,7 +952,7 @@ class NetworkServer(asyncio.DatagramProtocol):
             Command(device.next_command_id, "leave", "leave", cs.CMD_LEAVE, b"", now)
         ]
         device.next_command_id += 1
-        device.in_flight = None
+        device.acks = cs.CommandAcks[int](last_fcnt=device.last_fcnt)
         self.leaving[device.eui] = device
         _LOGGER.info("%s removed: LEAVE queued", device.name)
         self._save_soon()
@@ -951,29 +979,30 @@ class NetworkServer(asyncio.DatagramProtocol):
         return out, taken, len(taken) < len(device.commands)
 
     @callback
-    def _settle(self, device: Device, fcnt: int, dl_ack: bool) -> None:
-        """Settle the last downlink's commands on an uplink after it (07 section 7).
-
-        DL_ACK does not say which downlink it acknowledges (chrisuthe/ConnectSensors#8).
-        A sensor accepts only downlinks answering its latest uplink, so only an uplink
-        with a higher fcnt than that downlink's reply_to was sent after it; a late or
-        retransmitted earlier frame settles nothing.
-        """
-        if device.in_flight is None or fcnt <= device.in_flight[0]:
+    def _settle(self, device: Device, fcnt: int, counter: str, dl_ack: bool) -> None:
+        """Settle the commands awaiting acknowledgement on an uplink (07 section 7)."""
+        reply_to = device.acks.reply_to
+        delivered = device.acks.uplink(fcnt, counter, dl_ack)
+        if not delivered:
+            if reply_to is not None and counter == "accept" and fcnt > reply_to:
+                # Not acknowledged yet. The record stays, since a late arrival may
+                # still carry the DL_ACK, but a command sent too often is given up.
+                # LEAVE waits its 48 hours (04 section 6.1), however often it was sent.
+                self._give_up(
+                    device,
+                    [
+                        c
+                        for c in device.commands
+                        if c.id in device.acks.awaiting
+                        and c.sends >= COMMAND_MAX_SENDS
+                        and c.cmd != cs.CMD_LEAVE
+                    ],
+                )
             return
-        _, ids = device.in_flight
-        device.in_flight = None
-        sent = [c for c in device.commands if c.id in ids]
-        if dl_ack:
-            device.commands = [c for c in device.commands if c.id not in ids]
-            for c in sent:
-                self._delivered(device, c)
-        else:
-            # LEAVE waits its 48 hours (04 section 6.1), however often it was sent.
-            self._give_up(
-                device,
-                [c for c in sent if c.sends >= COMMAND_MAX_SENDS and c.cmd != cs.CMD_LEAVE],
-            )
+        done = [c for c in device.commands if c.id in delivered]
+        device.commands = [c for c in device.commands if c.id not in delivered]
+        for c in done:
+            self._delivered(device, c)
         self._save_soon()
         async_dispatcher_send(self.hass, signal_device_update(device.eui))
 
@@ -1131,7 +1160,7 @@ class NetworkServer(asyncio.DatagramProtocol):
 
     def _send(self, proxy: Proxy, msg_type: int, body: bytes) -> int:
         """Send a message in the proxy's session; returns its seq."""
-        boot_id = _boot_id(proxy.link)
+        boot_id = proxy.link.boot_id
         assert proxy.proxy_id is not None and proxy.addr is not None and boot_id is not None
         seq = proxy.link.next_seq() & 0xFFFFFFFF
         self._sendto(
@@ -1179,6 +1208,7 @@ class NetworkServer(asyncio.DatagramProtocol):
             if mismatch
             else None,
         )
+        self._check_keys()
         if proxy.proxy_id is not None and (previous is None or previous["fw"] != hello["fw"]):
             self._set_sw_version(proxy.proxy_id.hex(), hello["fw"])
         now = int(time.time())
@@ -1197,6 +1227,13 @@ class NetworkServer(asyncio.DatagramProtocol):
         pending = proxy.pending_downlinks.pop(seq, None)
         if pending is not None and pending.result is not None and not pending.result.done():
             pending.result.set_result(result)
+        if (
+            pending is not None
+            and result == "sent"
+            and (device := self.devices.get(pending.eui)) is not None
+            and device.join.sent(pending.frame)
+        ):
+            self._schedule_save()
         _LOGGER.debug(
             "%s: downlink %s to %s: %s, %.1f ms after target",
             proxy.name,
@@ -1354,8 +1391,7 @@ class NetworkServer(asyncio.DatagramProtocol):
             await self._async_save()
 
         queued = device.state == STATE_PAIRED
-        if fresh and queued:
-            self._settle(device, h.fcnt, bool(uflags & cs.UF_DL_ACK))
+        self._settle(device, h.fcnt, tx.counter, bool(uflags & cs.UF_DL_ACK))
         leaving = device.leaving_since is not None
         if leaving and device.eui not in self.leaving:
             return None  # LEAVE acknowledged or given up: the record is gone
@@ -1384,7 +1420,8 @@ class NetworkServer(asyncio.DatagramProtocol):
             return None
         if taken:
             tx.commands = taken
-            device.in_flight = (h.fcnt, [c.id for c in taken])
+            # Two answers to one uplink keep only the commands both carry (07 7).
+            device.acks.downlink(h.fcnt, [c.id for c in taken])
             self._save_soon()
             _LOGGER.debug(
                 "%s: sending %s with frame %s",
@@ -1523,7 +1560,7 @@ class NetworkServer(asyncio.DatagramProtocol):
             # A proxy removed while the uplink was collected is no longer asked.
             if self.proxies.get(r.proxy.subentry_id) is r.proxy
             and r.proxy.can_downlink
-            and r.boot_id == _boot_id(r.proxy.link)
+            and r.boot_id == r.proxy.link.boot_id
             and r.proxy.can_afford(airtime, now_ms)
         ]
 
@@ -1585,7 +1622,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         tx.commands = []
         proxy.airtime[seq] = (_now_ms(), airtime)
         future: asyncio.Future[str] | None = self.hass.loop.create_future() if wait else None
-        proxy.pending_downlinks[seq] = PendingDownlink(tx.device.eui, future)
+        proxy.pending_downlinks[seq] = PendingDownlink(tx.device.eui, downlink, future)
         while len(proxy.pending_downlinks) > TX_HISTORY:
             del proxy.pending_downlinks[next(iter(proxy.pending_downlinks))]
         window = "RX1" if offset == RX1_OFFSET_US else "RX2"
@@ -1622,7 +1659,8 @@ class NetworkServer(asyncio.DatagramProtocol):
                     "proxy_id": p.proxy_id_hex,
                     "connected": p.connected,
                     "radio_mismatch": p.radio_mismatch,
-                    "boot_id": _boot_id(p.link),
+                    "shared_key": p.shared,
+                    "boot_id": p.link.boot_id,
                     "hello": p.hello,
                     "uplinks": p.uplinks,
                     "downlinks_sent": p.downlinks_sent,

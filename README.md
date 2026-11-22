@@ -93,7 +93,7 @@ a repair issue suggests adding a proxy within range.
 
 - A per-device command queue (spec 07 section 7), persisted. Commands ride on the
   answer to the device's next uplink, which is answered for that reason alone, and are
-  sent again until an uplink after that answer has `DL_ACK`. A command not acknowledged
+  sent again until a newer uplink acknowledges them with `DL_ACK`. A command not acknowledged
   after 30 sends or 7 days is dropped and logged; the device's *Command* entity shows
   pending, delivered or failed.
 - Actions: `connect_sensors.set_heartbeat` and `connect_sensors.set_value` (command
@@ -105,6 +105,21 @@ a repair issue suggests adding a proxy within range.
   expected entities. Other profiles get entities from the readings they send.
 - A proxy whose `proxy_id` is derived from its MAC carries that MAC as a connection, so
   Home Assistant links it to the ESPHome device of the same board.
+
+## What the connectsensors 0.3.0 spec fixes change
+
+- `DL_ACK` is bound to the downlink it acknowledges (07 section 7): only an uplink
+  newer than that downlink delivers its commands, a late uplink can still carry the
+  acknowledgement, and when two answers to one uplink carry different commands only
+  those both carried count as delivered. Answers to late arrivals carry no commands.
+- A proxy is trusted for RX1 only if none of its last 20 `SENT` results was more than
+  30 ms late (07 section 6.2).
+- A pairing stalls after 3 repeated `JOIN`s counted from the first `KEY_EXCHANGE` a
+  proxy reported sent (07 section 5.1), and a sensor restarted mid-pairing gets a new
+  exchange (04 section 4.2).
+- Each proxy has a key of its own (05 section 4.2). Proxies that share a key get no
+  downlinks, and one that would accept them raises a repair issue that gives it a new
+  key.
 
 Not yet: mDNS, federation, key rotation, profile distribution (spec 10).
 
