@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 import json
 import struct
 import time
 from typing import Any
 
 import connectsensors as cs
-from homeassistant.const import STATE_OFF, STATE_ON
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, issue_registry as ir
+from homeassistant.util import dt as dt_util
 import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 from pytest_homeassistant_custom_component.components.diagnostics import (
     get_diagnostics_for_config_entry,
 )
@@ -356,3 +358,99 @@ async def test_diagnostics_redacted(
     assert device["k_session"] == "**REDACTED**"
     assert diag["server"]["proxies"]["proxy1"]["proxy_id"] == PROXY_ID.hex()
     assert diag["entry"]["data"]["k_net"] == "**REDACTED**"
+
+
+async def test_start_from_storage(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    hass_storage: dict[str, Any],
+) -> None:
+    """A start after a crash resumes counters from storage, never below a reservation."""
+    k_session = bytes(range(100, 116))
+    reserved, last_fcnt = 130, 500
+    record = {
+        "state": "paired",
+        "k_session": k_session.hex(),
+        "fcnt_down_reserved": reserved,
+        "last_fcnt": last_fcnt,
+        "seen": [],
+        "pending": None,
+        "stalled": False,
+        "readings": {"0:contact": 1},
+        "sw_version": None,
+        "last_seen": None,
+        "rssi": None,
+        "snr": None,
+    }
+    hass_storage["connect_sensors.state"] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": "connect_sensors.state",
+        "data": {"proxies": {}, "devices": {DEV_EUI: record}},
+    }
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert state_of(hass, DOOR).state == STATE_ON
+
+    untyped: Any = sensor.pairing
+    untyped.k_session = k_session
+    sensor.k_net_route = cs.derive_net_route(bytes.fromhex(K_NET))
+    sensor.server_time = int(time.time())
+    await proxy.connect()
+
+    # The last accepted counter is not accepted again.
+    sensor.fcnt = last_fcnt - 1
+    proxy.uplink(sensor.uplink(cs.T_DATA_CONFIRMED, cs.encode_reading(0, 0x01, 0)))
+    await proxy.nothing()
+    assert state_of(hass, DOOR).state == STATE_ON
+
+    rx = proxy.uplink(sensor.uplink(cs.T_DATA_CONFIRMED, cs.encode_reading(0, 0x01, 0)))
+    ack = sensor.downlink(await answer(proxy, rx))
+    assert ack["fcnt"] == reserved
+    await hass.async_block_till_done()
+    assert state_of(hass, DOOR).state == STATE_OFF
+    stored = hass_storage["connect_sensors.state"]["data"]["devices"][DEV_EUI]
+    assert stored["fcnt_down_reserved"] == reserved + 64
+
+
+async def test_counters_saved_under_steady_traffic(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Uplink counters reach storage within 10 s even while frames keep arriving."""
+    await proxy.connect()
+    await pair(hass, proxy, sensor)
+
+    def stored_fcnt() -> int:
+        value: int = hass_storage["connect_sensors.state"]["data"]["devices"][DEV_EUI]["last_fcnt"]
+        return value
+
+    start = dt_util.utcnow()
+    proxy.uplink(sensor.uplink(cs.T_DATA, cs.encode_reading(0, 0x01, 1)))
+    await proxy.nothing(0.2)
+    first = sensor.fcnt
+    assert stored_fcnt() < first
+    async_fire_time_changed(hass, start + timedelta(seconds=6))
+    await hass.async_block_till_done()
+    proxy.uplink(sensor.uplink(cs.T_DATA, cs.encode_reading(0, 0x01, 0)))
+    await proxy.nothing(0.2)
+    async_fire_time_changed(hass, start + timedelta(seconds=11))
+    await hass.async_block_till_done()
+    assert stored_fcnt() >= first
+
+
+async def test_stops_with_home_assistant(
+    hass: HomeAssistant, loaded: MockConfigEntry, proxy: SimProxy
+) -> None:
+    """At shutdown the server stops answering (entries are not unloaded then)."""
+    await proxy.connect()
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+    await hass.async_block_till_done()
+    proxy.hello()
+    await proxy.nothing()

@@ -15,16 +15,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
 import secrets
+import struct
 import time
 from typing import Any, cast
 
 import connectsensors as cs
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
-from homeassistant.const import CONF_PORT
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.const import CONF_PORT, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import CALLBACK_TYPE, CoreState, Event, HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
@@ -271,8 +272,13 @@ class NetworkServer(asyncio.DatagramProtocol):
         self.proxies: dict[str, Proxy] = {}
         self.devices: dict[str, Device] = {}
         self._by_proxy_id: dict[bytes, Proxy] = {}
-        self._root_store: Store[dict[str, int]] = Store(hass, STORAGE_VERSION, ROOT_STORAGE_KEY)
-        self._state_store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STATE_STORAGE_KEY)
+        # Atomic writes (fsync and rename): a counter lost to a power cut would be reused.
+        self._root_store: Store[dict[str, int]] = Store(
+            hass, STORAGE_VERSION, ROOT_STORAGE_KEY, atomic_writes=True
+        )
+        self._state_store: Store[dict[str, Any]] = Store(
+            hass, STORAGE_VERSION, STATE_STORAGE_KEY, atomic_writes=True
+        )
         self._root_counters: dict[str, int] = {}
         self._proxy_ids: dict[str, str] = {}
         self._stored_devices: dict[str, Any] = {}
@@ -285,6 +291,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._bootstrap: deque[int] = deque()
         self._tasks: set[asyncio.Task[None]] = set()
         self._unsub_tick: CALLBACK_TYPE | None = None
+        self._unsub_save: CALLBACK_TYPE | None = None
+        self._unsub_stop: CALLBACK_TYPE | None = None
         self._closed: asyncio.Future[None] | None = None
         self.foreign_frames = 0
 
@@ -304,13 +312,22 @@ class NetworkServer(asyncio.DatagramProtocol):
         )
         self._transport = transport
         self._unsub_tick = async_track_time_interval(self.hass, self._tick, TICK)
+        # Config entries are not unloaded at shutdown: stop answering and flush here.
+        self._unsub_stop = self.hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP, self._async_on_stop
+        )
         _LOGGER.debug("Listening for proxies on UDP %s", self.port)
+
+    async def _async_on_stop(self, _event: Event) -> None:
+        self._unsub_stop = None
+        await self.async_stop()
 
     async def async_stop(self) -> None:
         """Close the endpoint and flush state (07 section 10: on clean shutdown)."""
-        if self._unsub_tick:
-            self._unsub_tick()
-            self._unsub_tick = None
+        for unsub in (self._unsub_tick, self._unsub_save, self._unsub_stop):
+            if unsub:
+                unsub()
+        self._unsub_tick = self._unsub_save = self._unsub_stop = None
         if self._transport:
             self._closed = asyncio.get_running_loop().create_future()
             self._transport.close()
@@ -376,15 +393,30 @@ class NetworkServer(asyncio.DatagramProtocol):
             self._root_counters[eui] = int(d.join.root_fcnt_down)
         return self._root_counters
 
-    async def _async_save(self) -> None:
-        """Persist everything now and wait for the write."""
+    async def _async_save(self) -> bool:
+        """Persist everything now and wait for the write.
+
+        Returns False while Home Assistant is stopping: Store then defers the write
+        to the final write, so nothing that depends on it may be sent.
+        """
+        durable = self.hass.state is not CoreState.stopping
         await self._root_store.async_save(self._root_data())
         await self._state_store.async_save(self._state_data())
+        return durable
 
     @callback
     def _schedule_save(self) -> None:
-        """Persist within SAVE_DELAY_S (07 section 10, uplink counters)."""
-        self._state_store.async_delay_save(self._state_data, SAVE_DELAY_S)
+        """Persist within SAVE_DELAY_S of the first unsaved change (07 section 10).
+
+        Not Store.async_delay_save: it pushes the write back on every call, so steady
+        traffic could postpone it indefinitely.
+        """
+        if self._unsub_save is None:
+            self._unsub_save = async_call_later(self.hass, SAVE_DELAY_S, self._async_save_later)
+
+    async def _async_save_later(self, _now: datetime) -> None:
+        self._unsub_save = None
+        await self._async_save()
 
     # ------------------------------------------------------------------ tags
 
@@ -520,7 +552,7 @@ class NetworkServer(asyncio.DatagramProtocol):
                 self._uplink(proxy, m["boot_id"], body, now_ms)
             elif m["type"] == cs.M_TX_RESULT:
                 self._tx_result(proxy, body)
-        except (ValueError, IndexError) as err:
+        except (ValueError, IndexError, struct.error) as err:
             _LOGGER.debug("%s: malformed message type 0x%02x: %s", proxy.name, m["type"], err)
 
     def _sendto(self, data: bytes, addr: tuple[str, int]) -> None:
@@ -728,11 +760,13 @@ class NetworkServer(asyncio.DatagramProtocol):
 
         if not (tx.answer or (fresh and uflags & cs.UF_TIME_UNSURE)):
             return None
-        if commands:
-            # The device record must be on disk before SET_NETWORK goes out (04 section 4.6).
-            await self._async_save()
+        # The device record must be on disk before SET_NETWORK goes out (04 section 4.6).
+        if commands and not await self._async_save():
+            return None
         assert device.session_keys is not None
         fcnt = await self._next_fcnt_down(device)
+        if fcnt is None:
+            return None
         return cs.seal(
             device.session_keys,
             cs.T_DOWNLINK,
@@ -742,7 +776,7 @@ class NetworkServer(asyncio.DatagramProtocol):
             cs.downlink_payload(h.fcnt, int(time.time()), 0, commands),
         )
 
-    async def _join(self, tx: Transmission) -> bytes:
+    async def _join(self, tx: Transmission) -> bytes | None:
         """Answer a JOIN (07 section 5.1)."""
         device = tx.device
         r = device.join.join(tx.frame, secrets.token_bytes(32), int(time.time()))
@@ -752,7 +786,8 @@ class NetworkServer(asyncio.DatagramProtocol):
             self._clear_stall(device)
             self._rebuild_tags()
             # Root counter and pending exchange are on disk before KEY_EXCHANGE is sent.
-            await self._async_save()
+            if not await self._async_save():
+                return None
             _LOGGER.info("%s: key exchange started", device.name)
         else:
             self._schedule_save()
@@ -787,12 +822,16 @@ class NetworkServer(asyncio.DatagramProtocol):
             device.stalled = False
             ir.async_delete_issue(self.hass, DOMAIN, f"pairing_stalled_{device.eui}")
 
-    async def _next_fcnt_down(self, device: Device) -> int:
-        """Next session downlink counter, reserved in blocks (02 section 8.2 and 8.4)."""
+    async def _next_fcnt_down(self, device: Device) -> int | None:
+        """Next session downlink counter, reserved in blocks (02 section 8.2 and 8.4).
+
+        None if the reservation could not be written first.
+        """
         value = device.fcnt_down + 1
         if value >= device.fcnt_down_reserved:
             device.fcnt_down_reserved = value + RESERVE_BLOCK
-            await self._async_save()
+            if not await self._async_save():
+                return None
         device.fcnt_down = value
         return value
 
@@ -825,7 +864,12 @@ class NetworkServer(asyncio.DatagramProtocol):
     def _answer(self, tx: Transmission, downlink: bytes) -> None:
         """Send the downlink through the best proxy that heard it (07 section 6)."""
         candidates = [
-            r for r in tx.receptions if r.proxy.can_downlink and r.boot_id == _boot_id(r.proxy.link)
+            r
+            for r in tx.receptions
+            # A proxy removed while the uplink was collected is no longer asked.
+            if self.proxies.get(r.proxy.subentry_id) is r.proxy
+            and r.proxy.can_downlink
+            and r.boot_id == _boot_id(r.proxy.link)
         ]
         in_time = _now_ms() - tx.started_ms <= RX1_DEADLINE_MS
         rx1 = [r for r in candidates if not r.flags & cs.UPF_TS_UNCERTAIN]
