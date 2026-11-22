@@ -6,11 +6,11 @@ from dataclasses import dataclass
 from homeassistant.components.binary_sensor.const import BinarySensorDeviceClass
 from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.const import (
-    CONCENTRATION_PARTS_PER_MILLION,
     LIGHT_LUX,
     PERCENTAGE,
     UnitOfElectricPotential,
     UnitOfPressure,
+    UnitOfRatio,
     UnitOfTemperature,
 )
 
@@ -76,7 +76,7 @@ SENSOR_KINDS: dict[str, SensorKind] = {
         unknown=0xFFFF,
     ),
     "co2": SensorKind(
-        device_class=SensorDeviceClass.CO2, unit=CONCENTRATION_PARTS_PER_MILLION, unknown=0xFFFF
+        device_class=SensorDeviceClass.CO2, unit=UnitOfRatio.PARTS_PER_MILLION, unknown=0xFFFF
     ),
     "voltage": SensorKind(
         device_class=SensorDeviceClass.VOLTAGE,
