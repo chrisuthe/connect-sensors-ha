@@ -24,6 +24,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEntr
         await server.async_start()
     except OSError as err:
         await server.async_stop()
+        server.async_clear_issues()
         raise ConfigEntryNotReady(
             translation_domain=DOMAIN,
             translation_key="port_unavailable",
