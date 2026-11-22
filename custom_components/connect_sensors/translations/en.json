@@ -100,7 +100,41 @@
         "name": "Reachable"
       }
     },
+    "event": {
+      "button": {
+        "name": "Button",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "double_press": "Double press",
+              "long_press": "Long press",
+              "press": "Press",
+              "release": "Release"
+            }
+          }
+        }
+      }
+    },
     "sensor": {
+      "command": {
+        "name": "Command",
+        "state": {
+          "delivered": "Delivered",
+          "failed": "Failed",
+          "pending": "Pending"
+        },
+        "state_attributes": {
+          "last_command": {
+            "name": "Last command"
+          },
+          "last_result_at": {
+            "name": "Last result at"
+          },
+          "queued": {
+            "name": "Queued"
+          }
+        }
+      },
       "duplicates": {
         "name": "Duplicates dropped"
       },
@@ -158,8 +192,23 @@
     }
   },
   "exceptions": {
+    "not_paired": {
+      "message": "{name} is not paired yet, so it cannot receive commands."
+    },
+    "not_writable": {
+      "message": "{name}'s profile does not list channel {channel} ({kind}) as writable."
+    },
     "port_unavailable": {
       "message": "Cannot listen on UDP port {port}: {error}"
+    },
+    "queue_full": {
+      "message": "{name} already has the most commands queued; wait for it to acknowledge them."
+    },
+    "unknown_device": {
+      "message": "Device {device_id} is not a ConnectSensors sensor on a loaded network."
+    },
+    "value_out_of_range": {
+      "message": "The value does not fit a {kind} reading."
     }
   },
   "issues": {
@@ -181,11 +230,71 @@
     }
   },
   "selector": {
+    "kind": {
+      "options": {
+        "battery_percent": "Battery (%)",
+        "battery_voltage": "Battery voltage (mV)",
+        "binary": "On/off",
+        "co2": "CO₂ (ppm)",
+        "contact": "Contact",
+        "enum": "Enumeration",
+        "humidity": "Humidity (%)",
+        "illuminance": "Illuminance (lx)",
+        "int16": "16-bit integer",
+        "int32": "32-bit integer",
+        "leak": "Leak",
+        "motion": "Motion",
+        "percent": "Percent",
+        "pressure": "Pressure (hPa)",
+        "tamper": "Tamper",
+        "temperature": "Temperature (°C)",
+        "vibration": "Vibration",
+        "voltage": "Voltage (mV)"
+      }
+    },
     "region": {
       "options": {
         "eu868": "EU868 (provisional, untested)",
         "us915": "US915"
       }
+    }
+  },
+  "services": {
+    "set_heartbeat": {
+      "description": "Queues a SET_HEARTBEAT command for a sensor. It is sent with the answer to the sensor's next uplink, and once acknowledged the device's heartbeat setting follows it.",
+      "fields": {
+        "device_id": {
+          "description": "The sensor.",
+          "name": "Device"
+        },
+        "minutes": {
+          "description": "The new heartbeat interval, 1 to 1440 minutes.",
+          "name": "Minutes"
+        }
+      },
+      "name": "Set heartbeat"
+    },
+    "set_value": {
+      "description": "Queues a set-value command (0x40) for a writable channel of a sensor, sent with the answer to its next uplink.",
+      "fields": {
+        "channel": {
+          "description": "The channel to set, 0 to 255.",
+          "name": "Channel"
+        },
+        "device_id": {
+          "description": "The sensor.",
+          "name": "Device"
+        },
+        "kind": {
+          "description": "The reading kind of the channel.",
+          "name": "Kind"
+        },
+        "value": {
+          "description": "The value, in the units its entity shows (for example 21.5 for a temperature, 1 for on).",
+          "name": "Value"
+        }
+      },
+      "name": "Set value"
     }
   }
 }

@@ -87,11 +87,8 @@ SENSOR_KINDS: dict[str, SensorKind] = {
 
 SENSOR_STATE_CLASS = SensorStateClass.MEASUREMENT
 
-# Profile overrides of the default mapping (03 section 9), for the reference profiles.
-# The contact profile's channel 0 is a door.
-PROFILE_BINARY_OVERRIDES: dict[tuple[str, int, str], BinarySensorDeviceClass] = {
-    ("CS.CONTACT-1", 0, "contact"): BinarySensorDeviceClass.DOOR,
-}
+# Event kinds (03 section 4.1): shown as event entities, never as states.
+EVENT_KINDS = frozenset({"button"})
 
 
 def reading_key(channel: int, kind: str) -> str:
@@ -106,5 +103,5 @@ def split_reading_key(key: str) -> tuple[int, str]:
 
 
 def is_supported(kind: str) -> bool:
-    """Whether milestone 1 creates an entity for this kind."""
-    return kind in BINARY_KINDS or kind in SENSOR_KINDS
+    """Whether an entity is created for this kind."""
+    return kind in BINARY_KINDS or kind in SENSOR_KINDS or kind in EVENT_KINDS
