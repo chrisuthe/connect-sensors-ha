@@ -301,7 +301,7 @@ async def test_airtime_budget(
     runtime = loaded.runtime_data
     runtime.proxies["a"].airtime.clear()
     used = runtime.proxies["c"].airtime_used_ms(server._now_ms())
-    budget = "custom_components.connect_sensors.server.PROXY_AIRTIME_MS_PER_HOUR"
+    budget = "connectsensors.PROXY_AIRTIME_MS_PER_HOUR"
     with patch(budget, used + 70):
         rx = heard(proxies, confirmed(sensor), {"a": 2.0, "c": 5.0})
         sensor.downlink(await downlink(proxies["c"], rx["c"], RX1))

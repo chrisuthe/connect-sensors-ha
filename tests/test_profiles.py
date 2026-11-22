@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from homeassistant.const import CONF_PORT, STATE_UNKNOWN
+from dataclasses import asdict
+from datetime import timedelta
+
+from homeassistant.const import CONF_PORT, STATE_OFF, STATE_ON, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -18,12 +21,28 @@ from custom_components.connect_sensors.const import (
     SUBENTRY_DEVICE,
     SUBENTRY_PROXY,
 )
+from custom_components.connect_sensors.profiles import get_profile
 
 from .common import pair, parse_commands, uplink_answered
-from .conftest import DEV_EUI, K_NET, K_ROOT, PROXY_ID, PROXY_KEY, state_of
+from .conftest import DEV_EUI, K_NET, K_ROOT, PROXY_ID, PROXY_KEY, WallClock, state_of
 from .sim import SimProxy, SimSensor
 
 UNKNOWN_PROFILE = "ACME.THING-7"
+
+# Spec 03 section 9.2, as published.
+CLIMATE_1 = {
+    "profile": "CS.CLIMATE-1",
+    "name": "ConnectSensors climate sensor",
+    "manufacturer": "ConnectSensors reference design",
+    "model": "Climate v1",
+    "power": "battery",
+    "heartbeat_minutes": 30,
+    "channels": [
+        {"channel": 0, "kind": "temperature"},
+        {"channel": 0, "kind": "humidity"},
+        {"channel": 255, "kind": "battery_percent"},
+    ],
+}
 
 
 def entry_with_profile(port: int, profile: str) -> MockConfigEntry:
@@ -77,6 +96,38 @@ async def test_known_profile(hass: HomeAssistant, loaded: MockConfigEntry) -> No
     assert device.model == "Contact v1"
     assert device.model_id == "CS.CONTACT-1"
     assert loaded.runtime_data.devices[DEV_EUI].heartbeat_minutes == 30
+
+
+def test_climate_profile_matches_spec() -> None:
+    """CS.CLIMATE-1 is the published profile, field for field."""
+    profile = get_profile("CS.CLIMATE-1")
+    assert profile is not None
+    fields = asdict(profile)
+    del fields["any_writable"]
+    # Unset optional fields (no name, not writable) are absent from the JSON.
+    channels = [
+        {k: v for k, v in c.items() if v is not None and v is not False} for c in fields["channels"]
+    ]
+    assert {**fields, "channels": channels} == CLIMATE_1
+
+
+async def test_climate_supervision(
+    hass: HomeAssistant, port: int, proxy: SimProxy, sensor: SimSensor, wall: WallClock
+) -> None:
+    """CS.CLIMATE-1 heartbeats every 30 minutes: unreachable after 3 x 30 + 5."""
+    entry = entry_with_profile(port, "CS.CLIMATE-1")
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.runtime_data.devices[DEV_EUI].heartbeat_minutes == 30
+    await proxy.connect()
+    await pair(hass, proxy, sensor)
+    assert state_of(hass, "binary_sensor.thing_reachable").state == STATE_ON
+
+    await wall.advance(timedelta(minutes=94))
+    assert state_of(hass, "binary_sensor.thing_reachable").state == STATE_ON
+    await wall.advance(timedelta(minutes=2))
+    assert state_of(hass, "binary_sensor.thing_reachable").state == STATE_OFF
 
 
 async def test_unknown_profile(

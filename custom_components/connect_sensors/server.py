@@ -21,9 +21,6 @@ import time
 from typing import Any, cast
 
 import connectsensors as cs
-
-# airtime_ms is not in the package's public API yet (chrisuthe/ConnectSensors#56).
-from connectsensors._csframe import airtime_ms
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.const import CONF_PORT, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import CALLBACK_TYPE, CoreState, Event, HomeAssistant, callback
@@ -54,7 +51,6 @@ from .const import (
     EVENT_DEVICE_UNREACHABLE,
     EVENT_READING,
     LEAVE_EXPIRY_H,
-    PROXY_AIRTIME_MS_PER_HOUR,
     PROXY_TIMEOUT_S,
     REGIONS,
     RESERVE_BLOCK,
@@ -290,7 +286,7 @@ class Proxy:
         """Within its airtime budget, and not recently out of it."""
         if self.duty_cycle_until_ms is not None and now_ms < self.duty_cycle_until_ms:
             return False
-        return self.airtime_used_ms(now_ms) + airtime <= PROXY_AIRTIME_MS_PER_HOUR
+        return self.airtime_used_ms(now_ms) + airtime <= cs.PROXY_AIRTIME_MS_PER_HOUR
 
 
 class Device:
@@ -1538,8 +1534,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         opens RX2 only after a confirmed uplink (08 section 7).
         """
         rx2 = tx.header.ftype in CONFIRMED_TYPES
-        _, sf, bw = REGIONS[self.region]
-        airtime = airtime_ms(len(downlink), sf, bw * 1000)
+        airtime = cs.region_airtime_ms(self.region, len(downlink))
         candidates = self._candidates(tx, airtime)
         rx1: list[Reception] = []
         if _now_ms() - tx.started_ms <= RX1_DEADLINE_MS:

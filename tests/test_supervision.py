@@ -216,7 +216,7 @@ async def test_proxy_mismatch_issue(
     await proxy.connect(region="EU868")
     found = issue(hass, "proxy_mismatch_proxy1")
     assert found is not None and found.translation_placeholders is not None
-    assert found.translation_placeholders["proxy_settings"] == "EU868 918.5 MHz SF9 500 kHz"
+    assert found.translation_placeholders["proxy_settings"] == "EU868 869.525 MHz SF9 125 kHz"
     assert found.translation_placeholders["network_settings"] == "US915 918.5 MHz SF9 500 kHz"
 
     proxy.hello()

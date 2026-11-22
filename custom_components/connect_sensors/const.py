@@ -59,8 +59,6 @@ SNR_TIE_DB: Final = 1.0
 # for the longest EU868 frame the RX2 DOWNLINK still goes out 1 s before RX2.
 TX_RESULT_MARGIN_MS: Final = 500
 
-# Spec 01 section 5: a proxy transmits at most 72 s in any rolling hour.
-PROXY_AIRTIME_MS_PER_HOUR: Final = 72_000
 # After DUTY_CYCLE a proxy's budget frees up as its transmissions age out, at a
 # time the server cannot see; leave it alone for a while.
 DUTY_CYCLE_BACKOFF_S: Final = 600

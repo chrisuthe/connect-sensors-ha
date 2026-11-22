@@ -16,6 +16,7 @@ import connectsensors as cs
 from connectsensors._csframe import ProxyLink, SensorPairing
 
 COUNTERS = [10, 9, 1, 0, 0, 2, 0]
+FREQUENCY_HZ = {"US915": 918_500_000, "EU868": 869_525_000}
 
 
 def free_udp_port() -> int:
@@ -86,15 +87,16 @@ class SimProxy(asyncio.DatagramProtocol):
     def hello(
         self, nonce: int = 0, region: str = "US915", caps: int = cs.CAP_DOWNLINK
     ) -> dict[str, Any]:
-        """Send a HELLO (05 section 5.2)."""
+        """Send a HELLO (05 section 5.2), with the region profile's radio settings."""
+        sf, bw_hz = cs.REGIONS[region]
         return self.send(
             cs.M_HELLO,
             cs.hello_body(
                 caps,
                 region,
-                918_500_000,
-                9,
-                500,
+                FREQUENCY_HZ[region],
+                sf,
+                bw_hz // 1000,
                 42,
                 COUNTERS,
                 12,
