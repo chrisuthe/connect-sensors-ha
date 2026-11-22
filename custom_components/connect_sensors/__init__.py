@@ -6,15 +6,25 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers import config_validation as cv, issue_registry as ir
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
 from .server import STATE_STORAGE_KEY, STORAGE_VERSION, NetworkServer
+from .services import async_setup_services
 
-PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.EVENT, Platform.SENSOR]
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 type ConnectSensorsConfigEntry = ConfigEntry[NetworkServer]
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the actions, which work while a network is loaded."""
+    async_setup_services(hass)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEntry) -> bool:

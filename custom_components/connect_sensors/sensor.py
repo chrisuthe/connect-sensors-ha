@@ -57,6 +57,22 @@ def _pairing(device: Device) -> str:
     return "stalled" if device.stalled and device.state != STATE_PAIRED else device.state
 
 
+def _command(device: Device) -> str | None:
+    """Pending while any command is queued, else how the last one ended (07 section 7)."""
+    if device.commands:
+        return "pending"
+    return device.last_command["result"] if device.last_command else None
+
+
+def _command_attributes(device: Device) -> dict[str, Any]:
+    last = device.last_command
+    return {
+        "queued": [c.name for c in device.commands],
+        "last_command": last["name"] if last else None,
+        "last_result_at": last["at"] if last else None,
+    }
+
+
 DEVICE_SENSORS: tuple[DeviceSensorDescription, ...] = (
     DeviceSensorDescription(
         key="pairing",
@@ -96,6 +112,15 @@ DEVICE_SENSORS: tuple[DeviceSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda d: d.proxy_count if d.supervised else None,
         attributes_fn=lambda d: {"single_path": d.single_path},
+    ),
+    DeviceSensorDescription(
+        key="command",
+        translation_key="command",
+        device_class=SensorDeviceClass.ENUM,
+        options=["pending", "delivered", "failed"],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=_command,
+        attributes_fn=_command_attributes,
     ),
     DeviceSensorDescription(
         key="uplink_counter",
@@ -147,7 +172,7 @@ async def async_setup_entry(
     @callback
     def add_device(device: Device) -> None:
         entities: list[SensorEntity] = [DeviceSensor(device, d) for d in DEVICE_SENSORS]
-        entities.extend(_readings(device, list(device.readings)))
+        entities.extend(_readings(device, device.entity_keys()))
         async_add_entities(entities, config_subentry_id=device.subentry_id)
 
     @callback

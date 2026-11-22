@@ -43,8 +43,8 @@ from .const import (
     REGIONS,
     SUBENTRY_DEVICE,
     SUBENTRY_PROXY,
-    default_heartbeat,
 )
+from .profiles import default_heartbeat
 
 PORT_SELECTOR = NumberSelector(
     NumberSelectorConfig(min=1, max=65535, step=1, mode=NumberSelectorMode.BOX)

@@ -9,7 +9,7 @@ It listens for `cs_proxy` nodes on UDP, pairs sensors by their pairing code, and
 their readings into entities. The protocol itself comes from the
 [`connectsensors`](https://pypi.org/project/connectsensors/) package.
 
-**Status:** milestone 2a: delivery and supervision on top of the milestone 1 bench MVP. The protocol and this integration are drafts.
+**Status:** milestone 2: delivery, supervision, commands, events and device profiles on top of the milestone 1 bench MVP. The protocol and this integration are drafts.
 
 ## Install with HACS
 
@@ -35,7 +35,11 @@ Without HACS, copy `custom_components/connect_sensors` into your configuration's
 3. **Devices.** **Add device**, type the `CS:1:...` pairing code from inside the
    battery compartment, then press the device's button. The device's *Pairing*
    entity goes from *Waiting for button press* to *Exchanging keys* to *Paired*, and
-   its entities appear with its first readings.
+   its entities appear: those its profile lists straight away, others with the first
+   readings that carry them.
+4. **Removing a device** sends it `LEAVE` on its next uplink, if it is reachable, so it
+   returns to unpaired. Home Assistant forgets it once it acknowledges, or after 48
+   hours. Adding it again later just needs its pairing code and a button press.
 
 A device that was paired with another server, including `cs_testserver.py`, must be
 factory reset first: hold its button for 10 seconds. If you forget, pairing stalls and
@@ -50,7 +54,12 @@ again, and each reading comes back when an uplink carries it.
 
 Home Assistant cannot read a device's heartbeat interval from the device, so it
 assumes the profile's (30 minutes for `CS.CONTACT-1`, otherwise 60, `cs_sensor`'s
-default). If yours is configured differently, set it in the device's **Settings**.
+default). If yours is configured differently, set it in the device's **Settings**, or
+change the device itself with the `connect_sensors.set_heartbeat` action: once the
+device acknowledges it, the setting follows.
+
+Supervision changes fire `connect_sensors_device_unreachable` and
+`connect_sensors_device_reachable` events, with `device_id`, `dev_eui` and `name`.
 
 Each device's *Proxies hearing it* entity counts the proxies that heard it in the last
 24 hours, with a `single_path` attribute when only one did. If that lasts another day,
@@ -79,8 +88,24 @@ a repair issue suggests adding a proxy within range.
 - Repair issues, each cleared automatically: a stalled pairing, a proxy on other radio
   settings, an unreachable device, a single-path device.
 
-Not yet: command queue with resend, `SET_HEARTBEAT`, device profiles, events, mDNS,
-federation.
+## What milestone 2b adds
+
+- A per-device command queue (spec 07 section 7), persisted. Commands ride on the
+  answer to the device's next uplink, which is answered for that reason alone, and are
+  sent again until an uplink after that answer has `DL_ACK`. A command not acknowledged
+  after 30 sends or 7 days is dropped and logged; the device's *Command* entity shows
+  pending, delivered or failed.
+- Actions: `connect_sensors.set_heartbeat` and `connect_sensors.set_value` (command
+  `0x40`, for channels the profile lists as writable), and `LEAVE` on removal.
+- Events: a `button` reading fires the device's event entity (*press*, *double press*,
+  *long press*, *release*) and a `connect_sensors_event` bus event. It is never a state.
+- Device profiles, by the pairing code's profile id: `CS.CONTACT-1`, `CS.CLIMATE-1` and
+  `ESPHOME`. A profile sets the device's manufacturer, model, default heartbeat and
+  expected entities. Other profiles get entities from the readings they send.
+- A proxy whose `proxy_id` is derived from its MAC carries that MAC as a connection, so
+  Home Assistant links it to the ESPHome device of the same board.
+
+Not yet: mDNS, federation, key rotation, profile distribution (spec 10).
 
 ## Development
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
@@ -34,7 +35,12 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     BOOTSTRAP_PER_MINUTE,
+    BUTTON_EVENTS,
     COLLECTION_WINDOW_MS,
+    COMMAND_EXPIRY_H,
+    COMMAND_MAX_SENDS,
+    COMMAND_QUEUE_MAX,
+    COMMANDS_MAX_BYTES,
     CONF_DEV_EUI,
     CONF_HEARTBEAT,
     CONF_K_NET,
@@ -44,6 +50,10 @@ from .const import (
     CONF_REGION,
     DOMAIN,
     DUTY_CYCLE_BACKOFF_S,
+    EVENT_DEVICE_REACHABLE,
+    EVENT_DEVICE_UNREACHABLE,
+    EVENT_READING,
+    LEAVE_EXPIRY_H,
     PROXY_AIRTIME_MS_PER_HOUR,
     PROXY_TIMEOUT_S,
     REGIONS,
@@ -68,10 +78,11 @@ from .const import (
     TX_RESULT_MARGIN_MS,
     TX_RESULTS,
     UNREACHABLE_GRACE_MIN,
-    default_heartbeat,
+    signal_device_event,
     signal_device_update,
     signal_proxy_update,
 )
+from .profiles import Profile, default_heartbeat, get_profile
 from .readings import reading_key
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,6 +99,8 @@ HOUR_MS = 3_600_000
 SINGLE_PATH_WINDOW = timedelta(hours=SINGLE_PATH_WINDOW_H)
 SINGLE_PATH_REPAIR = timedelta(hours=SINGLE_PATH_REPAIR_H)
 DEVICE_ISSUES = ("pairing_stalled", "device_unreachable", "single_path")
+COMMAND_EXPIRY = timedelta(hours=COMMAND_EXPIRY_H)
+LEAVE_EXPIRY = timedelta(hours=LEAVE_EXPIRY_H)
 
 
 def _now_ms() -> int:
@@ -138,6 +151,46 @@ class PendingDownlink:
 
 
 @dataclass(slots=True)
+class Command:
+    """A queued command (07 section 7). `slot` names what it sets: a later command for
+    the same slot replaces it."""
+
+    id: int
+    name: str
+    slot: str
+    cmd: int
+    args: bytes
+    queued_at: datetime
+    sends: int = 0
+
+    @property
+    def encoded(self) -> bytes:
+        """Its TLV entry (02 section 10.3)."""
+        return cs.command(self.cmd, self.args)
+
+    def to_store(self) -> dict[str, Any]:
+        """The persisted entry (07 section 10)."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "slot": self.slot,
+            "cmd": self.cmd,
+            "args": self.args.hex(),
+            "queued_at": self.queued_at.isoformat(),
+            "sends": self.sends,
+        }
+
+    @classmethod
+    def from_store(cls, d: dict[str, Any]) -> Command:
+        """Restore a persisted entry."""
+        queued_at = _parse_time(d["queued_at"])
+        assert queued_at is not None
+        return cls(
+            d["id"], d["name"], d["slot"], d["cmd"], bytes.fromhex(d["args"]), queued_at, d["sends"]
+        )
+
+
+@dataclass(slots=True)
 class Reception:
     """One proxy's copy of a transmission (07 section 4, step 3)."""
 
@@ -162,6 +215,8 @@ class Transmission:
     answer: bool
     started_ms: int
     receptions: list[Reception] = field(default_factory=list)
+    # Queued commands the answer carries; each counts a send once a proxy is asked.
+    commands: list[Command] = field(default_factory=list)
 
 
 class Proxy:
@@ -241,13 +296,17 @@ class Proxy:
 class Device:
     """A sensor added by pairing code, in any pairing state."""
 
-    def __init__(self, subentry: ConfigSubentry, root_fcnt_down: int) -> None:
-        data = subentry.data
-        self.subentry_id = subentry.subentry_id
-        self.name = subentry.title
+    def __init__(
+        self, subentry_id: str, name: str, data: Mapping[str, Any], root_fcnt_down: int
+    ) -> None:
+        self.subentry_id = subentry_id
+        self.name = name
+        # Kept for a device that is leaving after its subentry was removed.
+        self.data = dict(data)
         self.dev_eui = bytes.fromhex(data[CONF_DEV_EUI])
         self.eui = data[CONF_DEV_EUI]
         self.profile: str = data[CONF_PROFILE]
+        self.profile_def: Profile | None = get_profile(self.profile)
         self.heartbeat_minutes: int = data.get(CONF_HEARTBEAT) or default_heartbeat(self.profile)
         k_root = bytes.fromhex(data[CONF_K_ROOT])
         self.root_keys = cs.keys_from(k_root, self.dev_eui)
@@ -274,7 +333,32 @@ class Device:
         # Proxy subentry_id -> when that proxy last heard the device (07 section 9).
         self.heard_by: dict[str, datetime] = {}
         self.single_path_since: datetime | None = None
+        # Event readings seen, by reading key: each has an event entity.
+        self.events: set[str] = set()
+        # The first event of a new key, for its entity to show once it is added.
+        self.first_events: dict[str, str] = {}
+        # Command queue (07 section 7), and the commands of the last downlink that
+        # carried any: (its reply_to, their ids), until the next uplink settles them.
+        self.commands: list[Command] = []
+        self.in_flight: tuple[int, list[int]] | None = None
+        self.next_command_id = 1
+        self.last_command: dict[str, str] | None = None
+        # Set while LEAVE is outstanding after the subentry was removed (04 section 6.1).
+        self.leaving_since: datetime | None = None
         self.lock = asyncio.Lock()
+
+    @classmethod
+    def from_subentry(cls, subentry: ConfigSubentry, root_fcnt_down: int) -> Device:
+        """The device a subentry describes."""
+        return cls(subentry.subentry_id, subentry.title, subentry.data, root_fcnt_down)
+
+    def entity_keys(self) -> list[str]:
+        """Reading keys with an entity: the profile's, then those heard (03 section 9.3)."""
+        keys = [c.key for c in self.profile_def.channels] if self.profile_def else []
+        for key in (*self.readings, *sorted(self.events)):
+            if key not in keys:
+                keys.append(key)
+        return keys
 
     @property
     def last_fcnt(self) -> int:
@@ -287,9 +371,21 @@ class Device:
         return self.state == STATE_PAIRED
 
     @property
+    def supervised_minutes(self) -> int:
+        """The heartbeat interval supervision allows for.
+
+        A sensor applies SET_HEARTBEAT on receipt and acknowledges it on the uplink
+        after, one new interval later, so a longer one counts from when it is queued.
+        """
+        queued = [
+            int.from_bytes(c.args, "big") for c in self.commands if c.cmd == cs.CMD_SET_HEARTBEAT
+        ]
+        return max([self.heartbeat_minutes, *queued])
+
+    @property
     def unreachable_after(self) -> timedelta:
         """Silence after which the device is unreachable (07 section 8.1)."""
-        return timedelta(minutes=3 * self.heartbeat_minutes + UNREACHABLE_GRACE_MIN)
+        return timedelta(minutes=3 * self.supervised_minutes + UNREACHABLE_GRACE_MIN)
 
     def recent_proxies(self, now: datetime) -> list[str]:
         """Subentry ids of the proxies that heard the device in the last 24 hours."""
@@ -345,6 +441,11 @@ class Device:
             "single_path_since": self.single_path_since.isoformat()
             if self.single_path_since
             else None,
+            "events": sorted(self.events),
+            "commands": [c.to_store() for c in self.commands],
+            "in_flight": list(self.in_flight) if self.in_flight else None,
+            "next_command_id": self.next_command_id,
+            "last_command": self.last_command,
         }
 
     def load_store(self, d: dict[str, Any]) -> None:
@@ -380,6 +481,13 @@ class Device:
             sid: t for sid, v in d.get("heard_by", {}).items() if (t := _parse_time(v)) is not None
         }
         self.single_path_since = _parse_time(d.get("single_path_since"))
+        # Added with commands and events.
+        self.events = set(d.get("events", []))
+        self.commands = [Command.from_store(c) for c in d.get("commands", [])]
+        if (flight := d.get("in_flight")) is not None:
+            self.in_flight = (flight[0], list(flight[1]))
+        self.next_command_id = d.get("next_command_id", 1)
+        self.last_command = d.get("last_command")
 
 
 class NetworkServer(asyncio.DatagramProtocol):
@@ -393,6 +501,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         self.k_net_route = cs.derive_net_route(bytes.fromhex(entry.data[CONF_K_NET]))
         self.proxies: dict[str, Proxy] = {}
         self.devices: dict[str, Device] = {}
+        # Devices whose subentry was removed, until they acknowledge LEAVE (04 6.1).
+        self.leaving: dict[str, Device] = {}
         self._by_proxy_id: dict[bytes, Proxy] = {}
         # Atomic writes (fsync and rename): a counter lost to a power cut would be reused.
         self._root_store: Store[dict[str, int]] = Store(
@@ -432,6 +542,21 @@ class NetworkServer(asyncio.DatagramProtocol):
         stored = await self._state_store.async_load() or {}
         self._proxy_ids = stored.get("proxies", {})
         self._stored_devices = stored.get("devices", {})
+        subentry_euis = {
+            s.data[CONF_DEV_EUI]
+            for s in self.entry.subentries.values()
+            if s.subentry_type == SUBENTRY_DEVICE
+        }
+        for eui, rec in stored.get("leaving", {}).items():
+            # Added again while Home Assistant was stopped: the new device wins.
+            if eui in subentry_euis:
+                continue
+            device = Device(
+                rec["subentry_id"], rec["name"], rec["data"], self._root_counters.get(eui, 0)
+            )
+            device.load_store(rec["record"])
+            device.leaving_since = _parse_time(rec["since"])
+            self.leaving[eui] = device
         self.async_sync_subentries(initial=True)
         self._rebuild_tags()
         # Repair issues are not kept across restarts: raise the current ones again.
@@ -486,10 +611,11 @@ class NetworkServer(asyncio.DatagramProtocol):
                     async_dispatcher_send(self.hass, signal_device_update(device.eui))
         removed = [eui for eui, d in self.devices.items() if d.subentry_id not in subentries]
         for eui in removed:
-            self.devices.pop(eui)
+            removed_device = self.devices.pop(eui)
             self._stored_devices.pop(eui, None)
             for issue in DEVICE_ISSUES:
                 self._set_issue(issue, eui, None)
+            self._start_leave(removed_device)
         if removed:
             self._identified.clear()
             self._rebuild_tags()
@@ -518,10 +644,23 @@ class NetworkServer(asyncio.DatagramProtocol):
                         known.profile
                     )
                     continue
-                device = Device(sub, self._root_counters.get(eui, 0))
+                device = Device.from_subentry(sub, self._root_counters.get(eui, 0))
+                left = None
                 if (record := self._stored_devices.get(eui)) is not None:
                     device.load_store(record)
+                elif (left := self.leaving.pop(eui, None)) is not None:
+                    # The sensor has not left, so it is still paired under these keys.
+                    device.join = left.join
+                    device.load_store(left.to_store())
+                    device.commands = []
+                    device.in_flight = None
+                    _LOGGER.info(
+                        "%s added again before it acknowledged LEAVE; LEAVE dropped", left.name
+                    )
                 self.devices[eui] = device
+                if left is not None:
+                    self._identified.clear()
+                    self._rebuild_tags()
                 if not initial:
                     async_dispatcher_send(self.hass, SIGNAL_DEVICE_ADDED, device)
         if not initial:
@@ -531,12 +670,36 @@ class NetworkServer(asyncio.DatagramProtocol):
 
     def _state_data(self) -> dict[str, Any]:
         self._stored_devices.update({eui: d.to_store() for eui, d in self.devices.items()})
-        return {"proxies": self._proxy_ids, "devices": self._stored_devices}
+        leaving = {
+            eui: {
+                "subentry_id": d.subentry_id,
+                "name": d.name,
+                "data": d.data,
+                "since": d.leaving_since.isoformat() if d.leaving_since else None,
+                "record": d.to_store(),
+            }
+            for eui, d in self.leaving.items()
+        }
+        return {"proxies": self._proxy_ids, "devices": self._stored_devices, "leaving": leaving}
 
     def _root_data(self) -> dict[str, int]:
-        for eui, d in self.devices.items():
+        for eui, d in self._all_devices():
             self._root_counters[eui] = int(d.join.root_fcnt_down)
         return self._root_counters
+
+    def _all_devices(self) -> Iterator[tuple[str, Device]]:
+        """Devices with a subentry, and those still leaving."""
+        yield from self.devices.items()
+        yield from self.leaving.items()
+
+    @callback
+    def _save_soon(self) -> None:
+        """Persist now, without waiting for it (07 section 10: the command queue)."""
+        if self._stopped:
+            return
+        task = self.hass.async_create_background_task(self._async_save_now(), f"{DOMAIN} save")
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def _async_save(self) -> bool:
         """Persist everything now and wait for the write.
@@ -564,6 +727,9 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._unsub_save = None
         await self._async_save()
 
+    async def _async_save_now(self) -> None:
+        await self._async_save()
+
     # ------------------------------------------------------------------ tags
 
     def _rebuild_tags(self) -> None:
@@ -571,7 +737,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         now = int(time.time())
         e = cs.epoch_of(now)
         table: dict[tuple[bytes, bytes], list[Device]] = {}
-        for device in self.devices.values():
+        for _, device in self._all_devices():
             if device.session_keys is None:
                 continue
             for epoch in (e - 1, e, e + 1):
@@ -613,8 +779,10 @@ class NetworkServer(asyncio.DatagramProtocol):
     @callback
     def _supervise(self, now: datetime) -> None:
         """Unreachable and single-path devices (07 section 8), and their repair issues."""
+        for device in list(self.leaving.values()):
+            self._expire_commands(device, now)
         for device in self.devices.values():
-            changed = False
+            changed = self._expire_commands(device, now)
             for sid in [s for s, t in device.heard_by.items() if now - t >= SINGLE_PATH_WINDOW]:
                 del device.heard_by[sid]
                 changed = True
@@ -627,8 +795,9 @@ class NetworkServer(asyncio.DatagramProtocol):
                     _LOGGER.info(
                         "%s is unreachable: nothing heard for %s minutes",
                         device.name,
-                        3 * device.heartbeat_minutes + UNREACHABLE_GRACE_MIN,
+                        3 * device.supervised_minutes + UNREACHABLE_GRACE_MIN,
                     )
+                    self._fire(EVENT_DEVICE_UNREACHABLE, device)
             single = device.single_path
             if single and device.single_path_since is None:
                 device.single_path_since = now
@@ -656,7 +825,7 @@ class NetworkServer(asyncio.DatagramProtocol):
             unreachable = {
                 "name": name,
                 "last_seen": dt_util.as_local(seen).strftime("%Y-%m-%d %H:%M") if seen else "-",
-                "heartbeat": str(device.heartbeat_minutes),
+                "heartbeat": str(device.supervised_minutes),
             }
         self._set_issue("device_unreachable", eui, unreachable)
         single_path = None
@@ -695,6 +864,176 @@ class NetworkServer(asyncio.DatagramProtocol):
             device.unreachable = False
             _LOGGER.info("%s is reachable again", device.name)
             self._set_issue("device_unreachable", device.eui, None)
+            self._fire(EVENT_DEVICE_REACHABLE, device)
+
+    @callback
+    def _fire(self, bus_event: str, device: Device, **extra: Any) -> None:
+        """Fire a bus event about a device (07 section 11.3)."""
+        registry = dr.async_get(self.hass)
+        entry = registry.async_get_device_by_identifier((DOMAIN, device.eui), self.entry.entry_id)
+        self.hass.bus.async_fire(
+            bus_event,
+            {
+                "device_id": entry.id if entry else None,
+                "dev_eui": device.eui,
+                "name": device.name,
+                **extra,
+            },
+        )
+
+    def device_for(self, device_id: str) -> Device | None:
+        """The sensor behind a device registry id."""
+        entry = dr.async_get(self.hass).async_get(device_id)
+        if entry is None or entry.config_entry_id != self.entry.entry_id:
+            return None
+        for domain, identifier in entry.identifiers:
+            if domain == DOMAIN and identifier in self.devices:
+                return self.devices[identifier]
+        return None
+
+    # ------------------------------------------------------------------ commands
+
+    async def async_queue(
+        self, device: Device, name: str, slot: str, cmd: int, args: bytes = b""
+    ) -> bool:
+        """Queue a command, replacing a queued one for the same slot (07 section 7).
+
+        Returns False if the queue is full. The queue is on disk when this returns.
+        """
+        kept = [c for c in device.commands if c.slot != slot]
+        if len(kept) >= COMMAND_QUEUE_MAX:
+            return False
+        device.commands = [
+            *kept,
+            Command(device.next_command_id, name, slot, cmd, args, _utcnow()),
+        ]
+        device.next_command_id += 1
+        _LOGGER.info("%s: %s queued", device.name, name)
+        async_dispatcher_send(self.hass, signal_device_update(device.eui))
+        await self._async_save()
+        return True
+
+    @callback
+    def _start_leave(self, device: Device) -> None:
+        """The device's subentry was removed (04 section 6.1).
+
+        A reachable paired device is sent LEAVE and kept until it acknowledges it or 48
+        hours pass. Any other device is forgotten now: it cannot be reached.
+        """
+        if not device.supervised or device.unreachable:
+            return
+        now = _utcnow()
+        device.leaving_since = now
+        device.commands = [
+            Command(device.next_command_id, "leave", "leave", cs.CMD_LEAVE, b"", now)
+        ]
+        device.next_command_id += 1
+        device.in_flight = None
+        self.leaving[device.eui] = device
+        _LOGGER.info("%s removed: LEAVE queued", device.name)
+        self._save_soon()
+
+    @callback
+    def _forget(self, device: Device) -> None:
+        """Delete a leaving device's record. Its root counter stays (02 section 8.4)."""
+        self._root_data()
+        if self.leaving.pop(device.eui, None) is not None:
+            self._identified.clear()
+            self._rebuild_tags()
+            self._save_soon()
+
+    def _take_commands(self, device: Device) -> tuple[bytes, list[Command], bool]:
+        """Queued commands that fit one downlink, in queue order, and whether more remain
+        (07 section 5)."""
+        out = b""
+        taken: list[Command] = []
+        for c in device.commands:
+            if len(out) + len(c.encoded) > COMMANDS_MAX_BYTES:
+                break
+            out += c.encoded
+            taken.append(c)
+        return out, taken, len(taken) < len(device.commands)
+
+    @callback
+    def _settle(self, device: Device, fcnt: int, dl_ack: bool) -> None:
+        """Settle the last downlink's commands on an uplink after it (07 section 7).
+
+        DL_ACK does not say which downlink it acknowledges (chrisuthe/ConnectSensors#8).
+        A sensor accepts only downlinks answering its latest uplink, so only an uplink
+        with a higher fcnt than that downlink's reply_to was sent after it; a late or
+        retransmitted earlier frame settles nothing.
+        """
+        if device.in_flight is None or fcnt <= device.in_flight[0]:
+            return
+        _, ids = device.in_flight
+        device.in_flight = None
+        sent = [c for c in device.commands if c.id in ids]
+        if dl_ack:
+            device.commands = [c for c in device.commands if c.id not in ids]
+            for c in sent:
+                self._delivered(device, c)
+        else:
+            # LEAVE waits its 48 hours (04 section 6.1), however often it was sent.
+            self._give_up(
+                device,
+                [c for c in sent if c.sends >= COMMAND_MAX_SENDS and c.cmd != cs.CMD_LEAVE],
+            )
+        self._save_soon()
+        async_dispatcher_send(self.hass, signal_device_update(device.eui))
+
+    @callback
+    def _delivered(self, device: Device, command: Command) -> None:
+        _LOGGER.info("%s acknowledged %s", device.name, command.name)
+        device.last_command = {
+            "name": command.name,
+            "result": "delivered",
+            "at": _utcnow().isoformat(),
+        }
+        if command.cmd == cs.CMD_SET_HEARTBEAT:
+            # The sensor uses it from now on; so do supervision and the Settings step.
+            minutes = int.from_bytes(command.args, "big")
+            device.heartbeat_minutes = minutes
+            subentry = self.entry.subentries.get(device.subentry_id)
+            if subentry is not None and device.leaving_since is None:
+                self.hass.config_entries.async_update_subentry(
+                    self.entry, subentry, data={**subentry.data, CONF_HEARTBEAT: minutes}
+                )
+        elif command.cmd == cs.CMD_LEAVE:
+            _LOGGER.info("%s left the network", device.name)
+            self._forget(device)
+
+    @callback
+    def _expire_commands(self, device: Device, now: datetime) -> bool:
+        """Drop commands not delivered in time (07 section 7). True if any were."""
+        expired = [
+            c
+            for c in device.commands
+            if now - c.queued_at >= (LEAVE_EXPIRY if c.cmd == cs.CMD_LEAVE else COMMAND_EXPIRY)
+        ]
+        if expired:
+            self._give_up(device, expired)
+        return bool(expired)
+
+    @callback
+    def _give_up(self, device: Device, commands: list[Command]) -> None:
+        """Drop undelivered commands, and say so (07 section 7)."""
+        if not commands:
+            return
+        ids = {c.id for c in commands}
+        device.commands = [c for c in device.commands if c.id not in ids]
+        for c in commands:
+            _LOGGER.warning(
+                "%s did not acknowledge %s, queued %s and sent %s times; given up",
+                device.name,
+                c.name,
+                dt_util.as_local(c.queued_at).strftime("%Y-%m-%d %H:%M"),
+                c.sends,
+            )
+            device.last_command = {"name": c.name, "result": "failed", "at": _utcnow().isoformat()}
+            if c.cmd == cs.CMD_LEAVE:
+                self._forget(device)
+        self._save_soon()
+        async_dispatcher_send(self.hass, signal_device_update(device.eui))
 
     # ------------------------------------------------------------------ UDP
 
@@ -940,7 +1279,7 @@ class NetworkServer(asyncio.DatagramProtocol):
                 return None
             self._bootstrap.append(now_ms)
             keyset = "root" if h.ftype == cs.T_JOIN else "session"
-            candidates = [(d, keyset) for d in self.devices.values()]
+            candidates = [(d, keyset) for _, d in self._all_devices()]
         for device, keyset in candidates:
             keys = self._keys_for(device, h.ftype, keyset)
             if keys is None:
@@ -1018,27 +1357,52 @@ class NetworkServer(asyncio.DatagramProtocol):
             _LOGGER.info("%s paired", device.name)
             await self._async_save()
 
-        if fresh:
+        queued = device.state == STATE_PAIRED
+        if fresh and queued:
+            self._settle(device, h.fcnt, bool(uflags & cs.UF_DL_ACK))
+        leaving = device.leaving_since is not None
+        if leaving and device.eui not in self.leaving:
+            return None  # LEAVE acknowledged or given up: the record is gone
+        if fresh and not leaving:
             self._apply_readings(device, tx.plaintext[1:])
             self._schedule_save()
             async_dispatcher_send(self.hass, signal_device_update(device.eui))
 
-        if not (tx.answer or (fresh and uflags & cs.UF_TIME_UNSURE)):
+        # Undelivered commands ride on any answer, and are a reason to answer (07 5).
+        # Not on an answer to a late arrival: the sensor accepts only a downlink that
+        # answers its latest uplink (02 section 10.2).
+        dflags = 0
+        taken: list[Command] = []
+        latest = h.fcnt >= device.last_fcnt
+        if queued and device.commands and latest and (fresh or tx.answer):
+            commands, taken, more = self._take_commands(device)
+            dflags = cs.DF_PENDING if more else 0
+        if not (tx.answer or taken or (fresh and uflags & cs.UF_TIME_UNSURE)):
             return None
         # The device record must be on disk before SET_NETWORK goes out (04 section 4.6).
-        if commands and not await self._async_save():
+        if commands and not taken and not await self._async_save():
             return None
         assert device.session_keys is not None
         fcnt = await self._next_fcnt_down(device)
         if fcnt is None:
             return None
+        if taken:
+            tx.commands = taken
+            device.in_flight = (h.fcnt, [c.id for c in taken])
+            self._save_soon()
+            _LOGGER.debug(
+                "%s: sending %s with frame %s",
+                device.name,
+                ", ".join(c.name for c in taken),
+                h.fcnt,
+            )
         return cs.seal(
             device.session_keys,
             cs.T_DOWNLINK,
             h.net_tag,
             h.dev_tag,
             fcnt,
-            cs.downlink_payload(h.fcnt, int(time.time()), 0, commands),
+            cs.downlink_payload(h.fcnt, int(time.time()), dflags, commands),
         )
 
     async def _join(self, tx: Transmission) -> bytes | None:
@@ -1124,14 +1488,35 @@ class NetworkServer(asyncio.DatagramProtocol):
                     device.sw_version = version
                     self._set_sw_version(device.eui, version)
                 continue
-            if name in ("unknown", "raw", "text", "button"):
+            if name == "button":
+                self._event(device, r["channel"], name, value)
+                continue
+            if name in ("unknown", "raw", "text"):
                 continue
             key = reading_key(r["channel"], name)
-            new = key not in device.readings
+            new = key not in device.entity_keys()
             device.readings[key] = value
             device.stale.discard(key)
             if new:
                 async_dispatcher_send(self.hass, SIGNAL_NEW_READING, device, key)
+
+    @callback
+    def _event(self, device: Device, channel: int, kind: str, value: int) -> None:
+        """An event reading: fires the event entity and a bus event, never a state
+        (03 section 5, 07 section 11.3)."""
+        event_type = BUTTON_EVENTS.get(value)
+        if event_type is None:
+            _LOGGER.debug("%s: %s value %s is not an event type", device.name, kind, value)
+            return
+        key = reading_key(channel, kind)
+        if key not in device.entity_keys():
+            device.events.add(key)
+            device.first_events[key] = event_type
+            async_dispatcher_send(self.hass, SIGNAL_NEW_READING, device, key)
+        else:
+            device.events.add(key)
+            async_dispatcher_send(self.hass, signal_device_event(device.eui), key, event_type)
+        self._fire(EVENT_READING, device, channel=channel, kind=kind, event_type=event_type)
 
     def _candidates(self, tx: Transmission, airtime: float) -> list[Reception]:
         """Receptions whose proxy may answer (07 section 6.1), within its airtime budget."""
@@ -1149,8 +1534,10 @@ class NetworkServer(asyncio.DatagramProtocol):
     async def _deliver(self, tx: Transmission, downlink: bytes) -> None:
         """Answer in RX1 through the best proxy, falling back to RX2 (07 section 6).
 
-        At most one proxy is asked per window, and RX2 only after RX1 failed.
+        At most one proxy is asked per window, and RX2 only after RX1 failed. A sensor
+        opens RX2 only after a confirmed uplink (08 section 7).
         """
+        rx2 = tx.header.ftype in CONFIRMED_TYPES
         _, sf, bw = REGIONS[self.region]
         airtime = airtime_ms(len(downlink), sf, bw * 1000)
         candidates = self._candidates(tx, airtime)
@@ -1165,6 +1552,12 @@ class NetworkServer(asyncio.DatagramProtocol):
             # The next best candidate, or the same proxy if it is the only one (6.3).
             candidates = self._candidates(tx, airtime)
             candidates = [r for r in candidates if r.proxy is not first.proxy] or candidates
+        if not rx2:
+            if not rx1:
+                _LOGGER.debug(
+                    "%s: no proxy can answer frame %s in RX1", tx.device.name, tx.header.fcnt
+                )
+            return
         if not candidates:
             _LOGGER.debug(
                 "%s: no proxy can answer frame %s%s",
@@ -1191,6 +1584,10 @@ class NetworkServer(asyncio.DatagramProtocol):
             proxy, cs.M_DOWNLINK, cs.downlink_msg_body(reception.rx_time_us, offset, downlink)
         )
         proxy.downlinks_sent += 1
+        # RX2 after RX1 resends the same frame: one send of its commands.
+        for c in tx.commands:
+            c.sends += 1
+        tx.commands = []
         proxy.airtime[seq] = (_now_ms(), airtime)
         future: asyncio.Future[str] | None = self.hass.loop.create_future() if wait else None
         proxy.pending_downlinks[seq] = PendingDownlink(tx.device.eui, future)
@@ -1243,8 +1640,16 @@ class NetworkServer(asyncio.DatagramProtocol):
             },
             "devices": {
                 eui: d.to_store()
-                | {"heartbeat_minutes": d.heartbeat_minutes, "single_path": d.single_path}
+                | {
+                    "profile": d.profile,
+                    "known_profile": d.profile_def is not None,
+                    "heartbeat_minutes": d.heartbeat_minutes,
+                    "single_path": d.single_path,
+                }
                 for eui, d in self.devices.items()
+            },
+            "leaving": {
+                eui: d.to_store() | {"since": d.leaving_since} for eui, d in self.leaving.items()
             },
             "root_counters": dict(self._root_data()),
         }

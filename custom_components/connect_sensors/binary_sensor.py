@@ -12,12 +12,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import ConnectSensorsConfigEntry
 from .const import SIGNAL_DEVICE_ADDED, SIGNAL_NEW_READING, SIGNAL_PROXY_BOUND
 from .entity import DeviceEntity, ProxyEntity, ReadingEntity
-from .readings import (
-    BINARY_KINDS,
-    BINARY_UNKNOWN,
-    PROFILE_BINARY_OVERRIDES,
-    split_reading_key,
-)
+from .readings import BINARY_KINDS, BINARY_UNKNOWN, split_reading_key
 from .server import Device, Proxy
 
 PARALLEL_UPDATES = 0
@@ -44,7 +39,7 @@ async def async_setup_entry(
     @callback
     def add_device(device: Device) -> None:
         async_add_entities([DeviceReachable(device)], config_subentry_id=device.subentry_id)
-        add_readings(device, list(device.readings))
+        add_readings(device, device.entity_keys())
 
     @callback
     def add_reading(device: Device, key: str) -> None:
@@ -69,11 +64,11 @@ class ReadingBinarySensor(ReadingEntity, BinarySensorEntity):
 
     def __init__(self, device: Device, key: str) -> None:
         super().__init__(device, key)
-        channel, kind = split_reading_key(key)
+        _, kind = split_reading_key(key)
         spec = BINARY_KINDS[kind]
-        self._attr_device_class = PROFILE_BINARY_OVERRIDES.get(
-            (device.profile, channel, kind), spec.device_class
-        )
+        self._attr_device_class = spec.device_class
+        if self.channel is not None and self.channel.binary_device_class is not None:
+            self._attr_device_class = self.channel.binary_device_class
         if self._attr_device_class is None:
             self._attr_translation_key = kind
         if spec.diagnostic:

@@ -1,0 +1,65 @@
+set_heartbeat:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: connect_sensors
+    minutes:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 1440
+          step: 1
+          mode: box
+          unit_of_measurement: min
+
+set_value:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: connect_sensors
+    channel:
+      required: true
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 255
+          step: 1
+          mode: box
+    kind:
+      required: true
+      selector:
+        select:
+          translation_key: kind
+          options:
+            - battery_percent
+            - battery_voltage
+            - binary
+            - co2
+            - contact
+            - enum
+            - humidity
+            - illuminance
+            - int16
+            - int32
+            - leak
+            - motion
+            - percent
+            - pressure
+            - tamper
+            - temperature
+            - vibration
+            - voltage
+    value:
+      required: true
+      selector:
+        number:
+          min: -2147483648
+          max: 2147483647
+          step: any
+          mode: box

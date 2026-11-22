@@ -45,3 +45,45 @@ async def pair(hass: HomeAssistant, proxy: SimProxy, sensor: SimSensor) -> dict[
     assert ack["reply_to"] == sensor.fcnt
     await hass.async_block_till_done()
     return ack
+
+
+def parse_commands(data: bytes) -> list[tuple[int, bytes]]:
+    """The commands of a downlink payload, as (cmd_id, args) (02 section 10.3)."""
+    out: list[tuple[int, bytes]] = []
+    i = 0
+    while i + 2 <= len(data):
+        n = data[i + 1]
+        out.append((data[i], data[i + 2 : i + 2 + n]))
+        i += 2 + n
+    return out
+
+
+async def uplink_answered(
+    hass: HomeAssistant,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    ftype: int = cs.T_HEARTBEAT,
+    uflags: int = 0,
+    readings: bytes | None = None,
+) -> dict[str, Any]:
+    """Send an uplink that must be answered in RX1; returns the accepted downlink."""
+    rx = proxy.uplink(sensor.uplink(ftype, full_state(0) if readings is None else readings, uflags))
+    dl = sensor.downlink(await answer(proxy, rx))
+    assert dl["reply_to"] == sensor.fcnt
+    dl["parsed"] = parse_commands(dl["commands"])
+    await hass.async_block_till_done()
+    return dl
+
+
+async def uplink_unanswered(
+    hass: HomeAssistant,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    ftype: int = cs.T_HEARTBEAT,
+    uflags: int = 0,
+    readings: bytes | None = None,
+) -> None:
+    """Send an uplink that the server must not answer."""
+    proxy.uplink(sensor.uplink(ftype, full_state(0) if readings is None else readings, uflags))
+    await proxy.nothing()
+    await hass.async_block_till_done()

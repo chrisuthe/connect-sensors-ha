@@ -27,11 +27,18 @@ class DeviceEntity(Entity):
     def __init__(self, device: Device, suffix: str) -> None:
         self.device = device
         self._attr_unique_id = f"{device.eui}_{suffix}"
+        profile = device.profile_def
+        # Manufacturer and model from the profile (07 section 11.2); else its id.
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device.eui)},
             name=device.name,
-            manufacturer="ConnectSensors" if device.profile.startswith("CS.") else None,
-            model=device.profile,
+            manufacturer=profile.manufacturer
+            if profile
+            else "ConnectSensors"
+            if device.profile.startswith("CS.")
+            else None,
+            model=profile.model if profile else device.profile,
+            model_id=device.profile,
             sw_version=device.sw_version,
             serial_number=device.eui.upper(),
         )
@@ -51,6 +58,9 @@ class ReadingEntity(DeviceEntity):
     def __init__(self, device: Device, key: str) -> None:
         super().__init__(device, key.replace(":", "_"))
         self._key = key
+        self.channel = device.profile_def.channel(key) if device.profile_def else None
+        if self.channel is not None and self.channel.name:
+            self._attr_name = self.channel.name
 
     @property
     def available(self) -> bool:
