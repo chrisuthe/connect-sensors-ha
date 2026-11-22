@@ -6,6 +6,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN
@@ -23,6 +24,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEntr
         await server.async_start()
     except OSError as err:
         await server.async_stop()
+        server.async_clear_issues()
         raise ConfigEntryNotReady(
             translation_domain=DOMAIN,
             translation_key="port_unavailable",
@@ -48,9 +50,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEnt
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         await entry.runtime_data.async_stop()
+        entry.runtime_data.async_clear_issues()
     return unloaded
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEntry) -> None:
     """Forget devices and proxies. Root downlink counters are kept (02 section 8.4)."""
+    registry = ir.async_get(hass)
+    for domain, issue_id in list(registry.issues):
+        if domain == DOMAIN:
+            ir.async_delete_issue(hass, DOMAIN, issue_id)
     await Store[dict[str, object]](hass, STORAGE_VERSION, STATE_STORAGE_KEY).async_remove()

@@ -29,7 +29,8 @@
   "config_subentries": {
     "device": {
       "abort": {
-        "already_configured": "This device is already added."
+        "already_configured": "This device is already added.",
+        "reconfigure_successful": "The device was updated."
       },
       "entry_type": "Device",
       "error": {
@@ -37,9 +38,20 @@
         "invalid_code": "This is not a valid ConnectSensors pairing code."
       },
       "initiate_flow": {
+        "reconfigure": "Settings",
         "user": "Add device"
       },
       "step": {
+        "reconfigure": {
+          "data": {
+            "heartbeat_minutes": "Heartbeat interval",
+            "name": "Name"
+          },
+          "data_description": {
+            "heartbeat_minutes": "How often the device sends a heartbeat, as set in its firmware. Home Assistant marks it unavailable after three missed heartbeats and 5 minutes. This does not change the device itself."
+          },
+          "title": "Device settings"
+        },
         "region_mismatch": {
           "description": "This device is built for {device_region}, but the network uses {network_region}. It will not be heard unless the radios match. Add it anyway?",
           "title": "Different region"
@@ -83,6 +95,9 @@
     "binary_sensor": {
       "binary": {
         "name": "State"
+      },
+      "reachable": {
+        "name": "Reachable"
       }
     },
     "sensor": {
@@ -113,6 +128,18 @@
       "percent": {
         "name": "Percent"
       },
+      "proxies": {
+        "name": "Proxies hearing it",
+        "state_attributes": {
+          "single_path": {
+            "name": "Single path",
+            "state": {
+              "false": "No",
+              "true": "Yes"
+            }
+          }
+        }
+      },
       "rate_limited": {
         "name": "Rate limited"
       },
@@ -136,9 +163,21 @@
     }
   },
   "issues": {
+    "device_unreachable": {
+      "description": "Home Assistant has not heard from {name} since {last_seen}: three heartbeat intervals of {heartbeat} minutes, and 5 minutes more. Its readings show as unavailable until it is heard again.\n\nCheck its battery and that a proxy within range is online. If the device's heartbeat is set to something other than {heartbeat} minutes, change it in the device's settings.",
+      "title": "{name} is unreachable"
+    },
     "pairing_stalled": {
       "description": "{name} keeps repeating its pairing request although Home Assistant answered it. It was probably paired with another server, or Home Assistant was restored from an older backup.\n\nHold the device's button for 10 seconds to factory-reset it, then press it again. If that does not help, move the device closer to a proxy.",
       "title": "Pairing {name} stalled"
+    },
+    "proxy_mismatch": {
+      "description": "{name} uses {proxy_settings}, but the network uses {network_settings}. Home Assistant sends no downlinks through it, so devices only it hears cannot pair or get their acknowledgements.\n\nSet `region: {region}` in the proxy's ESPHome configuration and install it again. This issue clears when the proxy reports matching settings.",
+      "title": "Proxy {name} uses other radio settings"
+    },
+    "single_path": {
+      "description": "For more than a day, only {proxy} has heard {name}. If that proxy goes offline, Home Assistant loses the device.\n\nAdd a proxy within range of {name} to give it a second path. This issue clears once another proxy hears it.",
+      "title": "Only one proxy hears {name}"
     }
   },
   "selector": {

@@ -32,7 +32,12 @@ class SimProxy(asyncio.DatagramProtocol):
     """A cs_proxy: sends envelopes to the server and checks what comes back (05 3.2)."""
 
     def __init__(
-        self, key: bytes, proxy_id: bytes, server_port: int, boot_id: int = 0x0B007001
+        self,
+        key: bytes,
+        proxy_id: bytes,
+        server_port: int,
+        boot_id: int = 0x0B007001,
+        rx_time_us: int = 5_000_000,
     ) -> None:
         self.key = key
         self.proxy_id = proxy_id
@@ -42,7 +47,9 @@ class SimProxy(asyncio.DatagramProtocol):
         self.seq = 0
         self.inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.transport: asyncio.DatagramTransport | None = None
-        self.rx_time_us = 5_000_000
+        self.rx_time_us = rx_time_us
+        # The TX_RESULT answering each DOWNLINK: (result, offset_us), or None for none.
+        self.tx_result: tuple[int, int] | None = (0, 1800)
 
     async def start(self) -> None:
         """Open a socket towards the server."""
@@ -63,6 +70,8 @@ class SimProxy(asyncio.DatagramProtocol):
         m = cs.open_envelope(self.key, data)
         m["verdict"] = self.link.receive(m, _ms())["result"]
         self.inbox.put_nowait(m)
+        if m["type"] == cs.M_DOWNLINK and m["verdict"] == "accepted" and self.tx_result:
+            self.send(cs.M_TX_RESULT, cs.tx_result_body(m["seq"], *self.tx_result))
 
     def send(self, msg_type: int, body: bytes) -> dict[str, Any]:
         """Send one message in this boot."""
@@ -74,12 +83,14 @@ class SimProxy(asyncio.DatagramProtocol):
         self.transport.sendto(data)
         return m
 
-    def hello(self, nonce: int = 0, region: str = "US915") -> dict[str, Any]:
+    def hello(
+        self, nonce: int = 0, region: str = "US915", caps: int = cs.CAP_DOWNLINK
+    ) -> dict[str, Any]:
         """Send a HELLO (05 section 5.2)."""
         return self.send(
             cs.M_HELLO,
             cs.hello_body(
-                cs.CAP_DOWNLINK,
+                caps,
                 region,
                 918_500_000,
                 9,
@@ -92,10 +103,10 @@ class SimProxy(asyncio.DatagramProtocol):
             ),
         )
 
-    def uplink(self, frame: bytes, rssi: float = -61.5, snr: float = 7.25) -> int:
+    def uplink(self, frame: bytes, rssi: float = -61.5, snr: float = 7.25, flags: int = 0) -> int:
         """Forward a frame; returns its rx_time_us."""
         self.rx_time_us += 7_000_000
-        self.send(cs.M_UPLINK, cs.uplink_body(self.rx_time_us, rssi, snr, 0, frame))
+        self.send(cs.M_UPLINK, cs.uplink_body(self.rx_time_us, rssi, snr, flags, frame))
         return self.rx_time_us
 
     async def recv(self, msg_type: int, within: float = 3.0) -> dict[str, Any]:
@@ -111,12 +122,12 @@ class SimProxy(asyncio.DatagramProtocol):
         await asyncio.sleep(wait)
         assert self.inbox.empty(), self.inbox.get_nowait()
 
-    async def connect(self) -> dict[str, Any]:
+    async def connect(self, region: str = "US915", caps: int = cs.CAP_DOWNLINK) -> dict[str, Any]:
         """Boot handshake: HELLO, HELLO_REQUEST, HELLO echoing the nonce, SERVER_STATUS."""
-        self.hello()
+        self.hello(region=region, caps=caps)
         request = await self.recv(cs.M_HELLO_REQUEST)
         (nonce,) = struct.unpack(">I", bytes.fromhex(request["body"]))
-        answer = self.hello(nonce)
+        answer = self.hello(nonce, region=region, caps=caps)
         status = await self.recv(cs.M_SERVER_STATUS)
         assert status["verdict"] in ("accepted", "resync")
         assert cs.parse_server_status(bytes.fromhex(status["body"]))["hello_seq"] == answer["seq"]

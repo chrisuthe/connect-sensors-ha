@@ -9,7 +9,7 @@ It listens for `cs_proxy` nodes on UDP, pairs sensors by their pairing code, and
 their readings into entities. The protocol itself comes from the
 [`connectsensors`](https://pypi.org/project/connectsensors/) package.
 
-**Status:** milestone 1, a bench MVP. The protocol and this integration are drafts.
+**Status:** milestone 2a: delivery and supervision on top of the milestone 1 bench MVP. The protocol and this integration are drafts.
 
 ## Install with HACS
 
@@ -41,6 +41,21 @@ A device that was paired with another server, including `cs_testserver.py`, must
 factory reset first: hold its button for 10 seconds. If you forget, pairing stalls and
 Home Assistant raises a repair issue saying so.
 
+## Supervision
+
+A paired device is *unreachable* when nothing has been heard from it for three
+heartbeat intervals and 5 minutes. Its readings then show as unavailable, never as
+their last value, and a repair issue is raised. The next uplink makes it reachable
+again, and each reading comes back when an uplink carries it.
+
+Home Assistant cannot read a device's heartbeat interval from the device, so it
+assumes the profile's (30 minutes for `CS.CONTACT-1`, otherwise 60, `cs_sensor`'s
+default). If yours is configured differently, set it in the device's **Settings**.
+
+Each device's *Proxies hearing it* entity counts the proxies that heard it in the last
+24 hours, with a `single_path` attribute when only one did. If that lasts another day,
+a repair issue suggests adding a proxy within range.
+
 ## What milestone 1 covers
 
 - UDP proxy sessions (`HELLO_REQUEST`, nonce echo, `SERVER_STATUS`), per-proxy keys.
@@ -54,9 +69,18 @@ Home Assistant raises a repair issue saying so.
 - State in Home Assistant's storage; keys and pairing codes never logged, and redacted
   from diagnostics.
 
-Not yet: command queue with resend, supervision (unavailable after missed heartbeats),
-RX2 fallback after a failed `TX_RESULT`, device profiles, repairs beyond a stalled
-pairing, mDNS, federation.
+## What milestone 2a adds
+
+- Proxy choice per spec 07 section 6: RX1 through the best-SNR copy among connected,
+  downlink-capable proxies on the network's radio profile with a healthy timing
+  record; RX2 through the next best when RX1 fails or its `TX_RESULT` does not come
+  back in time. One proxy per window, and each proxy's airtime budget is respected.
+- Supervision (above): unreachable devices, single-path devices.
+- Repair issues, each cleared automatically: a stalled pairing, a proxy on other radio
+  settings, an unreachable device, a single-path device.
+
+Not yet: command queue with resend, `SET_HEARTBEAT`, device profiles, events, mDNS,
+federation.
 
 ## Development
 

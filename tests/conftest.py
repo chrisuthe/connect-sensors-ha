@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, Generator
+from datetime import datetime, timedelta
 import logging
 import time
 from typing import Any
@@ -11,8 +13,9 @@ from unittest.mock import patch
 import connectsensors as cs
 from homeassistant.const import CONF_PORT
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
 from custom_components.connect_sensors.const import (
     CONF_DEV_EUI,
@@ -67,6 +70,39 @@ def clock() -> Generator[Clock]:
     """Control the server's monotonic clock (retransmission timing, proxy timeouts)."""
     c = Clock()
     with patch("custom_components.connect_sensors.server._now_ms", c):
+        yield c
+
+
+class WallClock:
+    """The server's wall clock, ahead of real time by a settable offset; advancing it
+    advances the monotonic clock too.
+
+    Not freezegun: frozen time stalls the real UDP traffic these tests run on.
+    """
+
+    def __init__(self, hass: HomeAssistant, clock: Clock) -> None:
+        self.hass = hass
+        self.clock = clock
+        self.offset = timedelta()
+
+    def __call__(self) -> datetime:
+        return dt_util.utcnow() + self.offset
+
+    async def advance(self, delta: timedelta) -> None:
+        """Let the time pass, and run Home Assistant's timers due by then."""
+        # Firing timers early would also expire in-flight TX_RESULT waits.
+        await asyncio.sleep(0.1)
+        self.offset += delta
+        self.clock.advance(int(delta.total_seconds() * 1000))
+        async_fire_time_changed(self.hass, self())
+        await self.hass.async_block_till_done()
+
+
+@pytest.fixture
+def wall(hass: HomeAssistant, clock: Clock) -> Generator[WallClock]:
+    """Control the server's wall clock (last seen, supervision)."""
+    c = WallClock(hass, clock)
+    with patch("custom_components.connect_sensors.server._utcnow", c):
         yield c
 
 

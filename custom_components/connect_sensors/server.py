@@ -20,6 +20,9 @@ import time
 from typing import Any, cast
 
 import connectsensors as cs
+
+# airtime_ms is not in the package's public API yet (chrisuthe/ConnectSensors#56).
+from connectsensors._csframe import airtime_ms
 from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.const import CONF_PORT, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import CALLBACK_TYPE, CoreState, Event, HomeAssistant, callback
@@ -33,28 +36,39 @@ from .const import (
     BOOTSTRAP_PER_MINUTE,
     COLLECTION_WINDOW_MS,
     CONF_DEV_EUI,
+    CONF_HEARTBEAT,
     CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
     CONF_PROFILE,
     CONF_REGION,
     DOMAIN,
+    DUTY_CYCLE_BACKOFF_S,
+    PROXY_AIRTIME_MS_PER_HOUR,
     PROXY_TIMEOUT_S,
     REGIONS,
     RESERVE_BLOCK,
     RX1_DEADLINE_MS,
+    RX1_MAX_LATE_OR_BUSY,
+    RX1_MAX_OFFSET_US,
     RX1_OFFSET_US,
     RX2_OFFSET_US,
     SAVE_DELAY_S,
     SIGNAL_DEVICE_ADDED,
     SIGNAL_NEW_READING,
     SIGNAL_PROXY_BOUND,
+    SINGLE_PATH_REPAIR_H,
+    SINGLE_PATH_WINDOW_H,
+    SNR_TIE_DB,
     STATE_EXCHANGED,
     STATE_PAIRED,
     STATE_SCANNED,
     SUBENTRY_DEVICE,
     SUBENTRY_PROXY,
+    TX_RESULT_MARGIN_MS,
     TX_RESULTS,
+    UNREACHABLE_GRACE_MIN,
+    default_heartbeat,
     signal_device_update,
     signal_proxy_update,
 )
@@ -70,10 +84,19 @@ STATE_STORAGE_KEY = f"{DOMAIN}.state"
 CONFIRMED_TYPES = frozenset({cs.T_DATA_CONFIRMED, cs.T_HEARTBEAT_CONFIRMED, cs.T_JOIN, cs.T_SYNC})
 TICK = timedelta(seconds=5)
 TX_HISTORY = 20
+HOUR_MS = 3_600_000
+SINGLE_PATH_WINDOW = timedelta(hours=SINGLE_PATH_WINDOW_H)
+SINGLE_PATH_REPAIR = timedelta(hours=SINGLE_PATH_REPAIR_H)
+DEVICE_ISSUES = ("pairing_stalled", "device_unreachable", "single_path")
 
 
 def _now_ms() -> int:
     return time.monotonic_ns() // 1_000_000
+
+
+def _utcnow() -> datetime:
+    """Wall-clock time, for last-seen times and supervision."""
+    return dt_util.utcnow()
 
 
 def _new_nonce() -> int:
@@ -95,6 +118,23 @@ def _pending(join: cs.JoinResponder) -> dict[str, Any] | None:
 def _set_pending(join: cs.JoinResponder, pending: dict[str, Any]) -> None:
     untyped: Any = join
     untyped.pending = pending
+
+
+def _radio(region: str, freq: int | None, sf: int, bw: int) -> str:
+    mhz = f" {freq / 1e6:g} MHz" if freq is not None else ""
+    return f"{region}{mhz} SF{sf} {bw} kHz"
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    return dt_util.parse_datetime(value) if value else None
+
+
+@dataclass(slots=True)
+class PendingDownlink:
+    """A DOWNLINK waiting for its TX_RESULT; result is set if someone waits for it."""
+
+    eui: str
+    result: asyncio.Future[str] | None
 
 
 @dataclass(slots=True)
@@ -141,7 +181,11 @@ class Proxy:
         self.uplinks = 0
         self.downlinks_sent = 0
         self.tx_results: deque[tuple[str, int]] = deque(maxlen=TX_HISTORY)
-        self.pending_downlinks: dict[int, str] = {}
+        self.tx_timeouts = 0
+        self.pending_downlinks: dict[int, PendingDownlink] = {}
+        # Airtime of downlinks sent, by DOWNLINK seq: (sent at ms, airtime ms).
+        self.airtime: dict[int, tuple[int, float]] = {}
+        self.duty_cycle_until_ms: int | None = None
 
     @property
     def proxy_id_hex(self) -> str | None:
@@ -167,6 +211,32 @@ class Proxy:
             and self.addr is not None
         )
 
+    @property
+    def timing_ok(self) -> bool:
+        """Trusted for RX1 by its last 20 results (07 section 6.2)."""
+        late = sum(1 for result, _ in self.tx_results if result in ("too_late", "busy"))
+        slow = any(
+            result == "sent" and offset > RX1_MAX_OFFSET_US for result, offset in self.tx_results
+        )
+        return late <= RX1_MAX_LATE_OR_BUSY and not slow
+
+    @property
+    def failures(self) -> int:
+        """Results other than SENT among the last 20, a missing one included."""
+        return sum(1 for result, _ in self.tx_results if result != "sent")
+
+    def airtime_used_ms(self, now_ms: int) -> float:
+        """Downlink airtime in the last hour, as far as the server knows (01 section 5)."""
+        for seq in [s for s, (at, _) in self.airtime.items() if now_ms - at >= HOUR_MS]:
+            del self.airtime[seq]
+        return sum(ms for _, ms in self.airtime.values())
+
+    def can_afford(self, airtime: float, now_ms: int) -> bool:
+        """Within its airtime budget, and not recently out of it."""
+        if self.duty_cycle_until_ms is not None and now_ms < self.duty_cycle_until_ms:
+            return False
+        return self.airtime_used_ms(now_ms) + airtime <= PROXY_AIRTIME_MS_PER_HOUR
+
 
 class Device:
     """A sensor added by pairing code, in any pairing state."""
@@ -178,6 +248,7 @@ class Device:
         self.dev_eui = bytes.fromhex(data[CONF_DEV_EUI])
         self.eui = data[CONF_DEV_EUI]
         self.profile: str = data[CONF_PROFILE]
+        self.heartbeat_minutes: int = data.get(CONF_HEARTBEAT) or default_heartbeat(self.profile)
         k_root = bytes.fromhex(data[CONF_K_ROOT])
         self.root_keys = cs.keys_from(k_root, self.dev_eui)
         self.join = cs.JoinResponder(k_root, self.dev_eui, root_fcnt_down)
@@ -190,15 +261,53 @@ class Device:
         self.readings: dict[str, Any] = {}
         self.sw_version: str | None = None
         self.last_seen: datetime | None = None
+        # Monotonic time of the last valid uplink in this run: silence is timed with
+        # it, so a wall-clock jump (NTP after boot) does not make devices unreachable.
+        self.last_heard_ms: int | None = None
         self.rssi: float | None = None
         self.snr: float | None = None
         self.stalled = False
+        # Supervision (07 section 8). stale: readings not heard since the device was
+        # last unreachable, shown as unavailable until an uplink carries them again.
+        self.unreachable = False
+        self.stale: set[str] = set()
+        # Proxy subentry_id -> when that proxy last heard the device (07 section 9).
+        self.heard_by: dict[str, datetime] = {}
+        self.single_path_since: datetime | None = None
         self.lock = asyncio.Lock()
 
     @property
     def last_fcnt(self) -> int:
         """Highest accepted uplink counter."""
         return int(self.uplinks.counter.last)
+
+    @property
+    def supervised(self) -> bool:
+        """Only paired devices send heartbeats."""
+        return self.state == STATE_PAIRED
+
+    @property
+    def unreachable_after(self) -> timedelta:
+        """Silence after which the device is unreachable (07 section 8.1)."""
+        return timedelta(minutes=3 * self.heartbeat_minutes + UNREACHABLE_GRACE_MIN)
+
+    def recent_proxies(self, now: datetime) -> list[str]:
+        """Subentry ids of the proxies that heard the device in the last 24 hours."""
+        return [sid for sid, t in self.heard_by.items() if now - t < SINGLE_PATH_WINDOW]
+
+    @property
+    def proxy_count(self) -> int:
+        """Proxies that heard the device in the last 24 hours (07 section 9)."""
+        return len(self.recent_proxies(_utcnow()))
+
+    @property
+    def single_path(self) -> bool:
+        """Heard by exactly one proxy over the last 24 hours (07 section 8.2)."""
+        return self.supervised and self.proxy_count == 1
+
+    def reading_available(self, key: str) -> bool:
+        """A reading is shown unless the device is unreachable or has not resent it."""
+        return not self.unreachable and key not in self.stale
 
     def set_session(self, k_session: bytes) -> None:
         """Start using a new k_session; its downlink counter starts at 1 (02 section 8.4)."""
@@ -230,6 +339,12 @@ class Device:
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
             "rssi": self.rssi,
             "snr": self.snr,
+            "unreachable": self.unreachable,
+            "stale": sorted(self.stale),
+            "heard_by": {sid: t.isoformat() for sid, t in self.heard_by.items()},
+            "single_path_since": self.single_path_since.isoformat()
+            if self.single_path_since
+            else None,
         }
 
     def load_store(self, d: dict[str, Any]) -> None:
@@ -255,9 +370,16 @@ class Device:
         self.stalled = d["stalled"]
         self.readings = d["readings"]
         self.sw_version = d["sw_version"]
-        self.last_seen = dt_util.parse_datetime(d["last_seen"]) if d["last_seen"] else None
+        self.last_seen = _parse_time(d["last_seen"])
         self.rssi = d["rssi"]
         self.snr = d["snr"]
+        # Added with supervision; older records lack them.
+        self.unreachable = d.get("unreachable", False)
+        self.stale = set(d.get("stale", []))
+        self.heard_by = {
+            sid: t for sid, v in d.get("heard_by", {}).items() if (t := _parse_time(v)) is not None
+        }
+        self.single_path_since = _parse_time(d.get("single_path_since"))
 
 
 class NetworkServer(asyncio.DatagramProtocol):
@@ -295,6 +417,11 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._stopped = False
         self._closed: asyncio.Future[None] | None = None
+        # Repair issues raised by this server, with their placeholders.
+        self._issues: dict[str, dict[str, str]] = {}
+        # Silence is counted from here at the earliest: nothing was heard while stopped.
+        self._started = _utcnow()
+        self._started_ms = _now_ms()
         self.foreign_frames = 0
 
     # ------------------------------------------------------------------ lifecycle
@@ -307,6 +434,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._stored_devices = stored.get("devices", {})
         self.async_sync_subentries(initial=True)
         self._rebuild_tags()
+        # Repair issues are not kept across restarts: raise the current ones again.
+        self._supervise(self._started)
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
             lambda: self, local_addr=("0.0.0.0", self.port)
@@ -351,11 +480,16 @@ class NetworkServer(asyncio.DatagramProtocol):
             if proxy.proxy_id is not None:
                 self._by_proxy_id.pop(proxy.proxy_id, None)
             self._proxy_ids.pop(sid, None)
+            self._set_issue("proxy_mismatch", sid, None)
+            for device in self.devices.values():
+                if device.heard_by.pop(sid, None) is not None:
+                    async_dispatcher_send(self.hass, signal_device_update(device.eui))
         removed = [eui for eui, d in self.devices.items() if d.subentry_id not in subentries]
         for eui in removed:
             self.devices.pop(eui)
             self._stored_devices.pop(eui, None)
-            ir.async_delete_issue(self.hass, DOMAIN, f"pairing_stalled_{eui}")
+            for issue in DEVICE_ISSUES:
+                self._set_issue(issue, eui, None)
         if removed:
             self._identified.clear()
             self._rebuild_tags()
@@ -363,7 +497,11 @@ class NetworkServer(asyncio.DatagramProtocol):
         for sid, sub in subentries.items():
             if sub.subentry_type == SUBENTRY_PROXY:
                 if sid in self.proxies:
-                    self.proxies[sid].name = sub.title
+                    known_proxy = self.proxies[sid]
+                    if known_proxy.name != sub.title:
+                        known_proxy.name = sub.title
+                        if known_proxy.proxy_id is not None:
+                            self._rename(known_proxy.proxy_id.hex(), sub.title)
                     continue
                 pid = self._proxy_ids.get(sid)
                 proxy = Proxy(sub, bytes.fromhex(pid) if pid else None)
@@ -372,8 +510,13 @@ class NetworkServer(asyncio.DatagramProtocol):
                     self._by_proxy_id[proxy.proxy_id] = proxy
             elif sub.subentry_type == SUBENTRY_DEVICE:
                 eui = sub.data[CONF_DEV_EUI]
-                if eui in self.devices:
-                    self.devices[eui].name = sub.title
+                if (known := self.devices.get(eui)) is not None:
+                    if known.name != sub.title:
+                        known.name = sub.title
+                        self._rename(eui, sub.title)
+                    known.heartbeat_minutes = sub.data.get(CONF_HEARTBEAT) or default_heartbeat(
+                        known.profile
+                    )
                     continue
                 device = Device(sub, self._root_counters.get(eui, 0))
                 if (record := self._stored_devices.get(eui)) is not None:
@@ -463,6 +606,95 @@ class NetworkServer(asyncio.DatagramProtocol):
             self._tag_time = now
         for proxy in self.proxies.values():
             async_dispatcher_send(self.hass, signal_proxy_update(proxy.subentry_id))
+        self._supervise(_utcnow())
+
+    # ------------------------------------------------------------------ supervision
+
+    @callback
+    def _supervise(self, now: datetime) -> None:
+        """Unreachable and single-path devices (07 section 8), and their repair issues."""
+        for device in self.devices.values():
+            changed = False
+            for sid in [s for s, t in device.heard_by.items() if now - t >= SINGLE_PATH_WINDOW]:
+                del device.heard_by[sid]
+                changed = True
+            if device.supervised and not device.unreachable:
+                heard_ms = device.last_heard_ms or self._started_ms
+                if _now_ms() - heard_ms > device.unreachable_after.total_seconds() * 1000:
+                    device.unreachable = True
+                    device.stale = set(device.readings)
+                    changed = True
+                    _LOGGER.info(
+                        "%s is unreachable: nothing heard for %s minutes",
+                        device.name,
+                        3 * device.heartbeat_minutes + UNREACHABLE_GRACE_MIN,
+                    )
+            single = device.single_path
+            if single and device.single_path_since is None:
+                device.single_path_since = now
+                changed = True
+            elif not single and device.single_path_since is not None:
+                device.single_path_since = None
+                changed = True
+            self._device_issues(device, now)
+            if changed:
+                self._schedule_save()
+                async_dispatcher_send(self.hass, signal_device_update(device.eui))
+
+    @callback
+    def _device_issues(self, device: Device, now: datetime) -> None:
+        """Raise or clear the device's repair issues to match its state."""
+        eui, name = device.eui, device.name
+        self._set_issue(
+            "pairing_stalled",
+            eui,
+            {"name": name} if device.stalled and device.state != STATE_PAIRED else None,
+        )
+        unreachable = None
+        if device.unreachable:
+            seen = device.last_seen
+            unreachable = {
+                "name": name,
+                "last_seen": dt_util.as_local(seen).strftime("%Y-%m-%d %H:%M") if seen else "-",
+                "heartbeat": str(device.heartbeat_minutes),
+            }
+        self._set_issue("device_unreachable", eui, unreachable)
+        single_path = None
+        since = device.single_path_since
+        if since is not None and now - since >= SINGLE_PATH_REPAIR:
+            sids = device.recent_proxies(now)
+            proxy = self.proxies.get(sids[0]) if sids else None
+            single_path = {"name": name, "proxy": proxy.name if proxy else "-"}
+        self._set_issue("single_path", eui, single_path)
+
+    @callback
+    def _set_issue(self, key: str, subject: str, placeholders: dict[str, str] | None) -> None:
+        """Raise issue `key` for a device or proxy with these placeholders, or clear it."""
+        issue_id = f"{key}_{subject}"
+        if placeholders is None:
+            self._issues.pop(issue_id, None)
+            # Also clears one left by an earlier instance of the server (a reload).
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            return
+        if self._issues.get(issue_id) == placeholders:
+            return
+        self._issues[issue_id] = placeholders
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=key,
+            translation_placeholders=placeholders,
+        )
+
+    def _reachable_again(self, device: Device) -> None:
+        """Any valid uplink clears unreachable (07 section 8.1)."""
+        if device.unreachable:
+            device.unreachable = False
+            _LOGGER.info("%s is reachable again", device.name)
+            self._set_issue("device_unreachable", device.eui, None)
 
     # ------------------------------------------------------------------ UDP
 
@@ -578,7 +810,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         hello = cs.parse_hello(body)
         previous, proxy.hello = proxy.hello, hello
         proxy.last_hello_ms = now_ms
-        proxy.last_hello = dt_util.utcnow()
+        proxy.last_hello = _utcnow()
         freq, sf, bw = REGIONS[self.region]
         mismatch = (
             hello["region"] != self.region
@@ -598,6 +830,20 @@ class NetworkServer(asyncio.DatagramProtocol):
                 self.region,
             )
         proxy.radio_mismatch = mismatch
+        self._set_issue(
+            "proxy_mismatch",
+            proxy.subentry_id,
+            {
+                "name": proxy.name,
+                "proxy_settings": _radio(
+                    hello["region"], hello["frequency_hz"], hello["sf"], hello["bw_khz"]
+                ),
+                "network_settings": _radio(self.region, freq, sf, bw),
+                "region": self.region,
+            }
+            if mismatch
+            else None,
+        )
         if proxy.proxy_id is not None and (previous is None or previous["fw"] != hello["fw"]):
             self._set_sw_version(proxy.proxy_id.hex(), hello["fw"])
         now = int(time.time())
@@ -606,14 +852,21 @@ class NetworkServer(asyncio.DatagramProtocol):
 
     def _tx_result(self, proxy: Proxy, body: bytes) -> None:
         t = cs.parse_tx_result(body)
+        seq = t["downlink_seq"]
         result = TX_RESULTS.get(t["result"], str(t["result"]))
         proxy.tx_results.append((result, t["offset_us"]))
-        eui = proxy.pending_downlinks.pop(t["downlink_seq"], None)
+        if result != "sent":
+            proxy.airtime.pop(seq, None)
+        if result == "duty_cycle":
+            proxy.duty_cycle_until_ms = _now_ms() + DUTY_CYCLE_BACKOFF_S * 1000
+        pending = proxy.pending_downlinks.pop(seq, None)
+        if pending is not None and pending.result is not None and not pending.result.done():
+            pending.result.set_result(result)
         _LOGGER.debug(
             "%s: downlink %s to %s: %s, %.1f ms after target",
             proxy.name,
-            t["downlink_seq"],
-            eui,
+            seq,
+            pending.eui if pending else None,
             result,
             t["offset_us"] / 1000,
         )
@@ -635,6 +888,11 @@ class NetworkServer(asyncio.DatagramProtocol):
             return
         device, keys, plaintext = identified
         got = device.uplinks.receive(frame, now_ms)
+        if got.get("counter") != "too_old":  # copies have no counter verdict
+            new_path = proxy.subentry_id not in device.heard_by
+            device.heard_by[proxy.subentry_id] = _utcnow()
+            if new_path:
+                async_dispatcher_send(self.hass, signal_device_update(device.eui))
         if got["result"] == "copy":
             if (tx := self._collecting.get(frame)) is not None:
                 tx.receptions.append(reception)
@@ -718,13 +976,15 @@ class NetworkServer(asyncio.DatagramProtocol):
             wait = tx.started_ms + COLLECTION_WINDOW_MS - _now_ms()
             if wait > 0:
                 await asyncio.sleep(wait / 1000)
-            self._answer(tx, downlink)
+            await self._deliver(tx, downlink)
         except asyncio.CancelledError:
             raise
         except Exception:
             _LOGGER.exception("Error processing an uplink from %s", tx.device.name)
         finally:
-            self._collecting.pop(tx.frame, None)
+            # A retransmission of the frame may have started its own collection.
+            if self._collecting.get(tx.frame) is tx:
+                del self._collecting[tx.frame]
 
     async def _act(self, tx: Transmission) -> bytes | None:
         """07 section 4, steps 6 and 7. Returns the downlink to send, if any."""
@@ -732,8 +992,10 @@ class NetworkServer(asyncio.DatagramProtocol):
         fresh = tx.counter in ("accept", "accept_late")
         if fresh:
             best = max(tx.receptions, key=lambda r: r.snr)
-            device.last_seen = dt_util.utcnow()
+            device.last_seen = _utcnow()
+            device.last_heard_ms = _now_ms()
             device.rssi, device.snr = best.rssi, best.snr
+            self._reachable_again(device)
 
         if h.ftype == cs.T_JOIN:
             return await self._join(tx) if tx.answer else None
@@ -800,18 +1062,24 @@ class NetworkServer(asyncio.DatagramProtocol):
                     "%s keeps repeating JOIN although it was answered: pairing stalled",
                     device.name,
                 )
-                ir.async_create_issue(
-                    self.hass,
-                    DOMAIN,
-                    f"pairing_stalled_{device.eui}",
-                    is_fixable=False,
-                    severity=ir.IssueSeverity.WARNING,
-                    translation_key="pairing_stalled",
-                    translation_placeholders={"name": device.name},
-                )
+                self._device_issues(device, _utcnow())
         async_dispatcher_send(self.hass, signal_device_update(device.eui))
         frame: bytes = r["frame"]
         return frame
+
+    def _rename(self, identifier: str, name: str) -> None:
+        """Follow a subentry rename in the device registry."""
+        registry = dr.async_get(self.hass)
+        entry = registry.async_get_device_by_identifier((DOMAIN, identifier), self.entry.entry_id)
+        if entry is not None:
+            registry.async_update_device(entry.id, name=name)
+
+    @callback
+    def async_clear_issues(self) -> None:
+        """Withdraw this server's repair issues: nothing watches them once it stops."""
+        for issue_id in list(self._issues):
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+        self._issues.clear()
 
     def _set_sw_version(self, identifier: str, version: str) -> None:
         """Keep the device registry's software version current."""
@@ -823,7 +1091,7 @@ class NetworkServer(asyncio.DatagramProtocol):
     def _clear_stall(self, device: Device) -> None:
         if device.stalled:
             device.stalled = False
-            ir.async_delete_issue(self.hass, DOMAIN, f"pairing_stalled_{device.eui}")
+            self._set_issue("pairing_stalled", device.eui, None)
 
     async def _next_fcnt_down(self, device: Device) -> int | None:
         """Next session downlink counter, reserved in blocks (02 section 8.2 and 8.4).
@@ -861,44 +1129,93 @@ class NetworkServer(asyncio.DatagramProtocol):
             key = reading_key(r["channel"], name)
             new = key not in device.readings
             device.readings[key] = value
+            device.stale.discard(key)
             if new:
                 async_dispatcher_send(self.hass, SIGNAL_NEW_READING, device, key)
 
-    def _answer(self, tx: Transmission, downlink: bytes) -> None:
-        """Send the downlink through the best proxy that heard it (07 section 6)."""
-        candidates = [
+    def _candidates(self, tx: Transmission, airtime: float) -> list[Reception]:
+        """Receptions whose proxy may answer (07 section 6.1), within its airtime budget."""
+        now_ms = _now_ms()
+        return [
             r
             for r in tx.receptions
             # A proxy removed while the uplink was collected is no longer asked.
             if self.proxies.get(r.proxy.subentry_id) is r.proxy
             and r.proxy.can_downlink
             and r.boot_id == _boot_id(r.proxy.link)
+            and r.proxy.can_afford(airtime, now_ms)
         ]
-        in_time = _now_ms() - tx.started_ms <= RX1_DEADLINE_MS
-        rx1 = [r for r in candidates if not r.flags & cs.UPF_TS_UNCERTAIN]
-        if rx1 and in_time:
-            pool, offset = rx1, RX1_OFFSET_US
-        elif candidates:
-            pool, offset = candidates, RX2_OFFSET_US
-        else:
-            _LOGGER.debug("%s: no proxy can answer frame %s", tx.device.name, tx.header.fcnt)
+
+    async def _deliver(self, tx: Transmission, downlink: bytes) -> None:
+        """Answer in RX1 through the best proxy, falling back to RX2 (07 section 6).
+
+        At most one proxy is asked per window, and RX2 only after RX1 failed.
+        """
+        _, sf, bw = REGIONS[self.region]
+        airtime = airtime_ms(len(downlink), sf, bw * 1000)
+        candidates = self._candidates(tx, airtime)
+        rx1: list[Reception] = []
+        if _now_ms() - tx.started_ms <= RX1_DEADLINE_MS:
+            rx1 = [r for r in candidates if not r.flags & cs.UPF_TS_UNCERTAIN and r.proxy.timing_ok]
+        if rx1:
+            first = _best(rx1)
+            result = await self._transmit(tx, first, RX1_OFFSET_US, downlink, airtime, wait=True)
+            if result == "sent":
+                return
+            # The next best candidate, or the same proxy if it is the only one (6.3).
+            candidates = self._candidates(tx, airtime)
+            candidates = [r for r in candidates if r.proxy is not first.proxy] or candidates
+        if not candidates:
+            _LOGGER.debug(
+                "%s: no proxy can answer frame %s%s",
+                tx.device.name,
+                tx.header.fcnt,
+                " in RX2" if rx1 else "",
+            )
             return
-        best = max(pool, key=lambda r: (r.snr, r.rssi))
-        proxy = best.proxy
+        await self._transmit(tx, _best(candidates), RX2_OFFSET_US, downlink, airtime, wait=False)
+
+    async def _transmit(
+        self,
+        tx: Transmission,
+        reception: Reception,
+        offset: int,
+        downlink: bytes,
+        airtime: float,
+        *,
+        wait: bool,
+    ) -> str | None:
+        """Ask one proxy to transmit; with wait, return its TX_RESULT (None if late)."""
+        proxy = reception.proxy
         seq = self._send(
-            proxy, cs.M_DOWNLINK, cs.downlink_msg_body(best.rx_time_us, offset, downlink)
+            proxy, cs.M_DOWNLINK, cs.downlink_msg_body(reception.rx_time_us, offset, downlink)
         )
         proxy.downlinks_sent += 1
-        proxy.pending_downlinks[seq] = tx.device.eui
+        proxy.airtime[seq] = (_now_ms(), airtime)
+        future: asyncio.Future[str] | None = self.hass.loop.create_future() if wait else None
+        proxy.pending_downlinks[seq] = PendingDownlink(tx.device.eui, future)
         while len(proxy.pending_downlinks) > TX_HISTORY:
             del proxy.pending_downlinks[next(iter(proxy.pending_downlinks))]
+        window = "RX1" if offset == RX1_OFFSET_US else "RX2"
         _LOGGER.debug(
             "%s: answered frame %s from %s in %s",
             proxy.name,
             tx.header.fcnt,
             tx.device.name,
-            "RX1" if offset == RX1_OFFSET_US else "RX2",
+            window,
         )
+        if future is None:
+            return None
+        try:
+            deadline = tx.started_ms + offset // 1000 + airtime + TX_RESULT_MARGIN_MS
+            async with asyncio.timeout((deadline - _now_ms()) / 1000):
+                return await future
+        except TimeoutError:
+            proxy.tx_timeouts += 1
+            # Counts as a failure when ranking proxies; a late result is still recorded.
+            proxy.tx_results.append(("no_result", 0))
+            _LOGGER.debug("%s: no TX_RESULT for the %s downlink in time", proxy.name, window)
+            return None
 
     # ------------------------------------------------------------------ diagnostics
 
@@ -918,9 +1235,23 @@ class NetworkServer(asyncio.DatagramProtocol):
                     "uplinks": p.uplinks,
                     "downlinks_sent": p.downlinks_sent,
                     "tx_results": list(p.tx_results),
+                    "tx_timeouts": p.tx_timeouts,
+                    "timing_ok": p.timing_ok,
+                    "airtime_last_hour_ms": round(p.airtime_used_ms(_now_ms()), 1),
                 }
                 for p in self.proxies.values()
             },
-            "devices": {eui: d.to_store() for eui, d in self.devices.items()},
+            "devices": {
+                eui: d.to_store()
+                | {"heartbeat_minutes": d.heartbeat_minutes, "single_path": d.single_path}
+                for eui, d in self.devices.items()
+            },
             "root_counters": dict(self._root_data()),
         }
+
+
+def _best(receptions: list[Reception]) -> Reception:
+    """Highest SNR; within 1 dB of it, higher RSSI, then fewer recent failures (6.2)."""
+    top = max(r.snr for r in receptions)
+    tied = [r for r in receptions if r.snr >= top - SNR_TIE_DB]
+    return max(tied, key=lambda r: (r.rssi, -r.proxy.failures))

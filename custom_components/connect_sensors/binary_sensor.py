@@ -11,7 +11,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ConnectSensorsConfigEntry
 from .const import SIGNAL_DEVICE_ADDED, SIGNAL_NEW_READING, SIGNAL_PROXY_BOUND
-from .entity import DeviceEntity, ProxyEntity
+from .entity import DeviceEntity, ProxyEntity, ReadingEntity
 from .readings import (
     BINARY_KINDS,
     BINARY_UNKNOWN,
@@ -43,6 +43,7 @@ async def async_setup_entry(
 
     @callback
     def add_device(device: Device) -> None:
+        async_add_entities([DeviceReachable(device)], config_subentry_id=device.subentry_id)
         add_readings(device, list(device.readings))
 
     @callback
@@ -63,12 +64,11 @@ async def async_setup_entry(
     entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_PROXY_BOUND, add_proxy))
 
 
-class ReadingBinarySensor(DeviceEntity, BinarySensorEntity):
+class ReadingBinarySensor(ReadingEntity, BinarySensorEntity):
     """A one-byte state reading (03 section 4.1)."""
 
     def __init__(self, device: Device, key: str) -> None:
-        super().__init__(device, f"{key.replace(':', '_')}")
-        self._key = key
+        super().__init__(device, key)
         channel, kind = split_reading_key(key)
         spec = BINARY_KINDS[kind]
         self._attr_device_class = PROFILE_BINARY_OVERRIDES.get(
@@ -86,6 +86,22 @@ class ReadingBinarySensor(DeviceEntity, BinarySensorEntity):
         if value is None or value == BINARY_UNKNOWN:
             return None
         return bool(value)
+
+
+class DeviceReachable(DeviceEntity, BinarySensorEntity):
+    """Heard within three heartbeat intervals and 5 minutes (07 sections 8.1 and 11.2)."""
+
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "reachable"
+
+    def __init__(self, device: Device) -> None:
+        super().__init__(device, "reachable")
+
+    @property
+    def is_on(self) -> bool | None:
+        """Unknown until the device is paired and supervised."""
+        return not self.device.unreachable if self.device.supervised else None
 
 
 class ProxyConnected(ProxyEntity, BinarySensorEntity):

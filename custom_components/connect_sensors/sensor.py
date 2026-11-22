@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -30,7 +31,7 @@ from .const import (
     STATE_PAIRED,
     STATE_SCANNED,
 )
-from .entity import DeviceEntity, ProxyEntity
+from .entity import DeviceEntity, ProxyEntity, ReadingEntity
 from .readings import SENSOR_KINDS, SENSOR_STATE_CLASS, split_reading_key
 from .server import Device, Proxy
 
@@ -42,6 +43,7 @@ class DeviceSensorDescription(SensorEntityDescription):
     """A diagnostic of a sensor device."""
 
     value_fn: Callable[[Device], str | int | float | datetime | None]
+    attributes_fn: Callable[[Device], dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -86,6 +88,14 @@ DEVICE_SENSORS: tuple[DeviceSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda d: d.snr,
+    ),
+    DeviceSensorDescription(
+        key="proxies",
+        translation_key="proxies",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda d: d.proxy_count if d.supervised else None,
+        attributes_fn=lambda d: {"single_path": d.single_path},
     ),
     DeviceSensorDescription(
         key="uplink_counter",
@@ -165,14 +175,13 @@ def _readings(device: Device, keys: list[str]) -> list[SensorEntity]:
     return [ReadingSensor(device, key) for key in keys if split_reading_key(key)[1] in SENSOR_KINDS]
 
 
-class ReadingSensor(DeviceEntity, SensorEntity):
+class ReadingSensor(ReadingEntity, SensorEntity):
     """A numeric reading (03 sections 4.1 and 4.2)."""
 
     _attr_state_class = SENSOR_STATE_CLASS
 
     def __init__(self, device: Device, key: str) -> None:
-        super().__init__(device, key.replace(":", "_"))
-        self._key = key
+        super().__init__(device, key)
         _, kind = split_reading_key(key)
         self._kind = SENSOR_KINDS[kind]
         self._attr_device_class = self._kind.device_class
@@ -206,6 +215,12 @@ class DeviceSensor(DeviceEntity, SensorEntity):
     def native_value(self) -> str | int | float | datetime | None:
         """Current value."""
         return self.entity_description.value_fn(self.device)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Extra diagnostics, for descriptions that have them."""
+        fn = self.entity_description.attributes_fn
+        return fn(self.device) if fn else None
 
 
 class ProxySensor(ProxyEntity, SensorEntity):
