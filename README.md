@@ -82,8 +82,9 @@ a repair issue suggests adding a proxy within range.
 
 - Proxy choice per spec 07 section 6: RX1 through the best-SNR copy among connected,
   downlink-capable proxies on the network's radio profile with a healthy timing
-  record; RX2 through the next best when RX1 fails or its `TX_RESULT` does not come
-  back in time. One proxy per window, and each proxy's airtime budget is respected.
+  record. For a confirmed uplink only, RX2 through the next best when RX1 fails or its
+  `TX_RESULT` does not come back in time (07 section 6.3). One proxy per window, and
+  each proxy's airtime budget is respected.
 - Supervision (above): unreachable devices, single-path devices.
 - Repair issues, each cleared automatically: a stalled pairing, a proxy on other radio
   settings, an unreachable device, a single-path device.

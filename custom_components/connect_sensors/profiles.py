@@ -7,6 +7,7 @@ profile is not listed here gets entities from the readings it sends (03 section 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from homeassistant.components.binary_sensor.const import BinarySensorDeviceClass
 
@@ -41,6 +42,7 @@ class Profile:
     name: str
     manufacturer: str | None
     model: str
+    power: Literal["battery", "mains"] | None = None
     heartbeat_minutes: int
     channels: tuple[Channel, ...] = ()
     # Firmware built from YAML (cs_sensor) decides its own channels, so any channel
@@ -68,6 +70,7 @@ PROFILES: dict[str, Profile] = {
             name="ConnectSensors contact sensor",
             manufacturer="ConnectSensors reference design",
             model="Contact v1",
+            power="battery",
             heartbeat_minutes=30,
             channels=(
                 Channel(
@@ -80,14 +83,14 @@ PROFILES: dict[str, Profile] = {
                 Channel(channel=255, kind="battery_percent"),
             ),
         ),
-        # A temperature and humidity sensor on the same reference design. Not yet
-        # published with the spec (chrisuthe/ConnectSensors#57).
+        # spec 03 section 9.2.
         Profile(
             profile="CS.CLIMATE-1",
             name="ConnectSensors climate sensor",
             manufacturer="ConnectSensors reference design",
             model="Climate v1",
-            heartbeat_minutes=15,
+            power="battery",
+            heartbeat_minutes=30,
             channels=(
                 Channel(channel=0, kind="temperature"),
                 Channel(channel=0, kind="humidity"),
