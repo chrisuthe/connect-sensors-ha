@@ -16,7 +16,8 @@ import connectsensors as cs
 from connectsensors._csframe import ProxyLink, SensorPairing
 
 COUNTERS = [10, 9, 1, 0, 0, 2, 0]
-FREQUENCY_HZ = {"US915": 918_500_000, "EU868": 869_525_000}
+# EU868 has no frequency yet: 865.2 MHz is the candidate in spec 01 section 3.2.
+FREQUENCY_HZ = {"US915": 918_500_000, "EU868": 865_200_000}
 
 
 def free_udp_port() -> int:
