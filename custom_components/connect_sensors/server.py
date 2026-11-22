@@ -293,6 +293,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._unsub_tick: CALLBACK_TYPE | None = None
         self._unsub_save: CALLBACK_TYPE | None = None
         self._unsub_stop: CALLBACK_TYPE | None = None
+        self._stopped = False
         self._closed: asyncio.Future[None] | None = None
         self.foreign_frames = 0
 
@@ -324,6 +325,7 @@ class NetworkServer(asyncio.DatagramProtocol):
 
     async def async_stop(self) -> None:
         """Close the endpoint and flush state (07 section 10: on clean shutdown)."""
+        self._stopped = True
         for unsub in (self._unsub_tick, self._unsub_save, self._unsub_stop):
             if unsub:
                 unsub()
@@ -399,10 +401,10 @@ class NetworkServer(asyncio.DatagramProtocol):
         Returns False while Home Assistant is stopping: Store then defers the write
         to the final write, so nothing that depends on it may be sent.
         """
-        durable = self.hass.state is not CoreState.stopping
         await self._root_store.async_save(self._root_data())
         await self._state_store.async_save(self._state_data())
-        return durable
+        # Checked after the writes: stopping may begin while they run.
+        return self.hass.state is not CoreState.stopping
 
     @callback
     def _schedule_save(self) -> None:
@@ -411,7 +413,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         Not Store.async_delay_save: it pushes the write back on every call, so steady
         traffic could postpone it indefinitely.
         """
-        if self._unsub_save is None:
+        # After stop, a late timer could overwrite a reloaded server's newer state.
+        if self._unsub_save is None and not self._stopped:
             self._unsub_save = async_call_later(self.hass, SAVE_DELAY_S, self._async_save_later)
 
     async def _async_save_later(self, _now: datetime) -> None:
