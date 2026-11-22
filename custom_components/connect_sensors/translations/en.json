@@ -1,0 +1,152 @@
+{
+  "config": {
+    "abort": {
+      "reconfigure_successful": "The network was updated.",
+      "single_instance_allowed": "ConnectSensors is already set up."
+    },
+    "step": {
+      "reconfigure": {
+        "data": {
+          "port": "Port"
+        },
+        "data_description": {
+          "port": "UDP port the proxies send to. Update each proxy's configuration to match."
+        }
+      },
+      "user": {
+        "data": {
+          "port": "Port",
+          "region": "Region profile"
+        },
+        "data_description": {
+          "port": "UDP port the proxies send to.",
+          "region": "The radio profile of your sensors and proxies. A network key is generated for you."
+        },
+        "description": "Set up the ConnectSensors network. Add proxies and devices to it afterwards."
+      }
+    }
+  },
+  "config_subentries": {
+    "device": {
+      "abort": {
+        "already_configured": "This device is already added."
+      },
+      "entry_type": "Device",
+      "error": {
+        "checksum_mismatch": "The pairing code's checksum does not match. Scan or type it again.",
+        "invalid_code": "This is not a valid ConnectSensors pairing code."
+      },
+      "initiate_flow": {
+        "user": "Add device"
+      },
+      "step": {
+        "region_mismatch": {
+          "description": "This device is built for {device_region}, but the network uses {network_region}. It will not be heard unless the radios match. Add it anyway?",
+          "title": "Different region"
+        },
+        "user": {
+          "data": {
+            "name": "Name",
+            "pairing_code": "Pairing code"
+          },
+          "data_description": {
+            "name": "Optional. Defaults to the model and the end of the device ID.",
+            "pairing_code": "The CS:1:... code inside the battery compartment or on the insert."
+          },
+          "description": "After adding the device, press its button. It pairs through any of your proxies within range.\n\nA second-hand device must be factory reset first: hold its button for 10 seconds."
+        }
+      }
+    },
+    "proxy": {
+      "entry_type": "Proxy",
+      "initiate_flow": {
+        "reconfigure": "Show configuration",
+        "user": "Add proxy"
+      },
+      "step": {
+        "reconfigure": {
+          "data": {
+            "name": "Name"
+          },
+          "description": "The proxy's configuration:\n\n```yaml\n{snippet}```"
+        },
+        "user": {
+          "data": {
+            "name": "Name"
+          },
+          "description": "Paste this into the proxy's ESPHome configuration and install it. The proxy appears here when it first connects.\n\n```yaml\n{snippet}```\n\nThe key is shown here only until you leave this dialog; it is kept in Home Assistant and can be shown again from the proxy's menu."
+        }
+      }
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "binary": {
+        "name": "State"
+      }
+    },
+    "sensor": {
+      "duplicates": {
+        "name": "Duplicates dropped"
+      },
+      "forwarded": {
+        "name": "Frames forwarded"
+      },
+      "heard": {
+        "name": "Packets heard"
+      },
+      "invalid": {
+        "name": "Invalid packets"
+      },
+      "last_seen": {
+        "name": "Last seen"
+      },
+      "pairing": {
+        "name": "Pairing",
+        "state": {
+          "exchanged": "Exchanging keys",
+          "paired": "Paired",
+          "scanned": "Waiting for button press",
+          "stalled": "Stalled"
+        }
+      },
+      "percent": {
+        "name": "Percent"
+      },
+      "rate_limited": {
+        "name": "Rate limited"
+      },
+      "snr": {
+        "name": "Signal-to-noise ratio"
+      },
+      "tx_failed": {
+        "name": "Downlinks failed"
+      },
+      "tx_ok": {
+        "name": "Downlinks sent"
+      },
+      "uplink_counter": {
+        "name": "Uplink counter"
+      }
+    }
+  },
+  "exceptions": {
+    "port_unavailable": {
+      "message": "Cannot listen on UDP port {port}: {error}"
+    }
+  },
+  "issues": {
+    "pairing_stalled": {
+      "description": "{name} keeps repeating its pairing request although Home Assistant answered it. It was probably paired with another server, or Home Assistant was restored from an older backup.\n\nHold the device's button for 10 seconds to factory-reset it, then press it again. If that does not help, move the device closer to a proxy.",
+      "title": "Pairing {name} stalled"
+    }
+  },
+  "selector": {
+    "region": {
+      "options": {
+        "eu868": "EU868 (provisional, untested)",
+        "us915": "US915"
+      }
+    }
+  }
+}
