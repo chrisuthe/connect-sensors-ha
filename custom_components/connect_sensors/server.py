@@ -65,7 +65,7 @@ from .const import (
     STATE_SCANNED,
     SUBENTRY_DEVICE,
     SUBENTRY_PROXY,
-    TX_RESULT_WAIT_MS,
+    TX_RESULT_MARGIN_MS,
     TX_RESULTS,
     UNREACHABLE_GRACE_MIN,
     default_heartbeat,
@@ -222,7 +222,7 @@ class Proxy:
 
     @property
     def failures(self) -> int:
-        """Results other than SENT among the last 20."""
+        """Results other than SENT among the last 20, a missing one included."""
         return sum(1 for result, _ in self.tx_results if result != "sent")
 
     def airtime_used_ms(self, now_ms: int) -> float:
@@ -261,6 +261,9 @@ class Device:
         self.readings: dict[str, Any] = {}
         self.sw_version: str | None = None
         self.last_seen: datetime | None = None
+        # Monotonic time of the last valid uplink in this run: silence is timed with
+        # it, so a wall-clock jump (NTP after boot) does not make devices unreachable.
+        self.last_heard_ms: int | None = None
         self.rssi: float | None = None
         self.snr: float | None = None
         self.stalled = False
@@ -418,6 +421,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._issues: dict[str, dict[str, str]] = {}
         # Silence is counted from here at the earliest: nothing was heard while stopped.
         self._started = _utcnow()
+        self._started_ms = _now_ms()
         self.foreign_frames = 0
 
     # ------------------------------------------------------------------ lifecycle
@@ -478,7 +482,8 @@ class NetworkServer(asyncio.DatagramProtocol):
             self._proxy_ids.pop(sid, None)
             self._set_issue("proxy_mismatch", sid, None)
             for device in self.devices.values():
-                device.heard_by.pop(sid, None)
+                if device.heard_by.pop(sid, None) is not None:
+                    async_dispatcher_send(self.hass, signal_device_update(device.eui))
         removed = [eui for eui, d in self.devices.items() if d.subentry_id not in subentries]
         for eui in removed:
             self.devices.pop(eui)
@@ -492,7 +497,11 @@ class NetworkServer(asyncio.DatagramProtocol):
         for sid, sub in subentries.items():
             if sub.subentry_type == SUBENTRY_PROXY:
                 if sid in self.proxies:
-                    self.proxies[sid].name = sub.title
+                    known_proxy = self.proxies[sid]
+                    if known_proxy.name != sub.title:
+                        known_proxy.name = sub.title
+                        if known_proxy.proxy_id is not None:
+                            self._rename(known_proxy.proxy_id.hex(), sub.title)
                     continue
                 pid = self._proxy_ids.get(sid)
                 proxy = Proxy(sub, bytes.fromhex(pid) if pid else None)
@@ -502,7 +511,9 @@ class NetworkServer(asyncio.DatagramProtocol):
             elif sub.subentry_type == SUBENTRY_DEVICE:
                 eui = sub.data[CONF_DEV_EUI]
                 if (known := self.devices.get(eui)) is not None:
-                    known.name = sub.title
+                    if known.name != sub.title:
+                        known.name = sub.title
+                        self._rename(eui, sub.title)
                     known.heartbeat_minutes = sub.data.get(CONF_HEARTBEAT) or default_heartbeat(
                         known.profile
                     )
@@ -608,8 +619,8 @@ class NetworkServer(asyncio.DatagramProtocol):
                 del device.heard_by[sid]
                 changed = True
             if device.supervised and not device.unreachable:
-                heard = max(device.last_seen or self._started, self._started)
-                if now - heard > device.unreachable_after:
+                heard_ms = device.last_heard_ms or self._started_ms
+                if _now_ms() - heard_ms > device.unreachable_after.total_seconds() * 1000:
                     device.unreachable = True
                     device.stale = set(device.readings)
                     changed = True
@@ -982,6 +993,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         if fresh:
             best = max(tx.receptions, key=lambda r: r.snr)
             device.last_seen = _utcnow()
+            device.last_heard_ms = _now_ms()
             device.rssi, device.snr = best.rssi, best.snr
             self._reachable_again(device)
 
@@ -1054,6 +1066,20 @@ class NetworkServer(asyncio.DatagramProtocol):
         async_dispatcher_send(self.hass, signal_device_update(device.eui))
         frame: bytes = r["frame"]
         return frame
+
+    def _rename(self, identifier: str, name: str) -> None:
+        """Follow a subentry rename in the device registry."""
+        registry = dr.async_get(self.hass)
+        entry = registry.async_get_device_by_identifier((DOMAIN, identifier), self.entry.entry_id)
+        if entry is not None:
+            registry.async_update_device(entry.id, name=name)
+
+    @callback
+    def async_clear_issues(self) -> None:
+        """Withdraw this server's repair issues: nothing watches them once it stops."""
+        for issue_id in list(self._issues):
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+        self._issues.clear()
 
     def _set_sw_version(self, identifier: str, version: str) -> None:
         """Keep the device registry's software version current."""
@@ -1181,10 +1207,13 @@ class NetworkServer(asyncio.DatagramProtocol):
         if future is None:
             return None
         try:
-            async with asyncio.timeout((tx.started_ms + TX_RESULT_WAIT_MS - _now_ms()) / 1000):
+            deadline = tx.started_ms + offset // 1000 + airtime + TX_RESULT_MARGIN_MS
+            async with asyncio.timeout((deadline - _now_ms()) / 1000):
                 return await future
         except TimeoutError:
             proxy.tx_timeouts += 1
+            # Counts as a failure when ranking proxies; a late result is still recorded.
+            proxy.tx_results.append(("no_result", 0))
             _LOGGER.debug("%s: no TX_RESULT for the %s downlink in time", proxy.name, window)
             return None
 

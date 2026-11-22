@@ -11,6 +11,7 @@ from homeassistant.config_entries import SOURCE_RECONFIGURE, SOURCE_USER
 from homeassistant.const import CONF_NAME, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import device_registry as dr
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -212,3 +213,7 @@ async def test_device_settings(hass: HomeAssistant, loaded: MockConfigEntry) -> 
     await hass.async_block_till_done()
     device = loaded.runtime_data.devices[DEV_EUI]
     assert (device.name, device.heartbeat_minutes) == ("Back door", 5)
+    registered = dr.async_get(hass).async_get_device_by_identifier(
+        (DOMAIN, DEV_EUI), loaded.entry_id
+    )
+    assert registered is not None and registered.name == "Back door"

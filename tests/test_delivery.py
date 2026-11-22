@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import patch
 
@@ -86,13 +86,6 @@ async def proxies(port: int) -> AsyncGenerator[dict[str, SimProxy]]:
     yield sims
     for sim in sims.values():
         sim.close()
-
-
-@pytest.fixture
-def short_wait() -> Generator[None]:
-    """Give up on a missing TX_RESULT sooner than the real 1.5 s."""
-    with patch("custom_components.connect_sensors.server.TX_RESULT_WAIT_MS", 400):
-        yield
 
 
 async def paired(
@@ -258,7 +251,6 @@ async def test_rx2_after_tx_result_timeout(
     loaded: MockConfigEntry,
     proxies: dict[str, SimProxy],
     sensor: SimSensor,
-    short_wait: None,
 ) -> None:
     """No TX_RESULT in time from the RX1 proxy: RX2 through the next best."""
     await paired(hass, proxies, sensor)
@@ -267,7 +259,9 @@ async def test_rx2_after_tx_result_timeout(
     first = await downlink(proxies["b"], rx["b"], RX1)
     assert await downlink(proxies["c"], rx["c"], RX2) == first
     await silent(proxies, "a", "b", "c", wait=0.6)
-    assert loaded.runtime_data.proxies["b"].tx_timeouts == 1
+    b = loaded.runtime_data.proxies["b"]
+    assert b.tx_timeouts == 1
+    assert b.failures == 1  # ranks below an equal proxy that does report
 
 
 async def test_single_proxy_falls_back_to_itself(

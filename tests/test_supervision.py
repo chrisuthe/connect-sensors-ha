@@ -11,7 +11,7 @@ from homeassistant.config_entries import ConfigSubentry
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
 from custom_components.connect_sensors.const import CONF_HEARTBEAT, CONF_KEY, DOMAIN
 
@@ -38,6 +38,8 @@ async def heartbeat(
     hass: HomeAssistant, proxy: SimProxy, sensor: SimSensor, readings: bytes | None = None
 ) -> None:
     """A confirmed heartbeat at the current time, answered in RX1."""
+    proxy.hello()  # time has passed: it would be offline otherwise
+    await proxy.recv(cs.M_SERVER_STATUS)
     sensor.server_time = int(time.time())
     rx = proxy.uplink(
         sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0) if readings is None else readings)
@@ -131,6 +133,7 @@ async def test_restart(
     await pair(hass, proxy, sensor)
     await hass.config_entries.async_unload(loaded.entry_id)
     wall.offset += SILENCE * 2
+    wall.clock.advance(int(SILENCE.total_seconds() * 2000))
     assert await hass.config_entries.async_setup(loaded.entry_id)
     await hass.async_block_till_done()
     await wall.advance(timedelta(minutes=5))
@@ -179,6 +182,8 @@ async def test_single_path(
     await second.start()
     try:
         await second.connect()
+        proxy.hello()
+        await proxy.recv(cs.M_SERVER_STATUS)
         sensor.server_time = int(time.time())
         frame = sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0))
         rx = proxy.uplink(frame, snr=9.0)
@@ -271,5 +276,50 @@ async def test_issues_cleared_when_device_removed(
     await wall.advance(SILENCE + timedelta(minutes=1))
     assert issue(hass, UNREACHABLE) is not None
     hass.config_entries.async_remove_subentry(loaded, "device1")
+    await hass.async_block_till_done()
+    assert issue(hass, UNREACHABLE) is None
+
+
+async def test_wall_clock_jump(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    wall: WallClock,
+) -> None:
+    """A wall-clock jump (NTP setting the clock after boot) is not silence."""
+    await proxy.connect()
+    await pair(hass, proxy, sensor)
+    wall.offset += timedelta(hours=6)
+    async_fire_time_changed(hass, wall())
+    await hass.async_block_till_done()
+    assert state_of(hass, DOOR).state == STATE_OFF
+    assert issue(hass, UNREACHABLE) is None
+
+
+async def test_issues_withdrawn_on_unload(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    wall: WallClock,
+) -> None:
+    """Nothing watches the issues once the integration is unloaded or removed."""
+    await proxy.connect()
+    await pair(hass, proxy, sensor)
+    await wall.advance(SILENCE + timedelta(minutes=1))
+    assert issue(hass, UNREACHABLE) is not None
+    assert await hass.config_entries.async_unload(loaded.entry_id)
+    assert issue(hass, UNREACHABLE) is None
+
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        UNREACHABLE,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="device_unreachable",
+    )
+    assert await hass.config_entries.async_remove(loaded.entry_id)
     await hass.async_block_till_done()
     assert issue(hass, UNREACHABLE) is None

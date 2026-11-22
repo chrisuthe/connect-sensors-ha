@@ -54,10 +54,10 @@ RX1_MAX_OFFSET_US: Final = 80_000
 RX1_MAX_LATE_OR_BUSY: Final = 2
 SNR_TIE_DB: Final = 1.0
 
-# How long after the first copy of an uplink the RX1 proxy's TX_RESULT may take.
-# RX1 transmits 1 s after the uplink, so this leaves about 0.4 s for the result to
-# arrive and still 1.5 s for the RX2 DOWNLINK to reach the next proxy.
-TX_RESULT_WAIT_MS: Final = 1_500
+# How long after the RX1 transmission (1 s after the uplink, plus the frame's
+# airtime, in case a proxy reports only once done) its TX_RESULT may take. Even
+# for the longest EU868 frame the RX2 DOWNLINK still goes out 1 s before RX2.
+TX_RESULT_MARGIN_MS: Final = 500
 
 # Spec 01 section 5: a proxy transmits at most 72 s in any rolling hour.
 PROXY_AIRTIME_MS_PER_HOUR: Final = 72_000
@@ -76,8 +76,8 @@ DEFAULT_HEARTBEAT_MINUTES: Final = 60
 UNREACHABLE_GRACE_MIN: Final = 5
 
 # Spec 07 section 8.2: single-path over the last 24 hours. The repair issue waits
-# until that has held for another 24 hours, so a newly paired device, a proxy
-# reboot or a second proxy still being placed does not raise one.
+# until the device has been single-path for 24 hours straight, so a newly paired
+# device or a second proxy still being placed does not raise one.
 SINGLE_PATH_WINDOW_H: Final = 24
 SINGLE_PATH_REPAIR_H: Final = 24
 

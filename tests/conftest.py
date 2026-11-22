@@ -74,13 +74,15 @@ def clock() -> Generator[Clock]:
 
 
 class WallClock:
-    """The server's wall clock, ahead of real time by a settable offset.
+    """The server's wall clock, ahead of real time by a settable offset; advancing it
+    advances the monotonic clock too.
 
     Not freezegun: frozen time stalls the real UDP traffic these tests run on.
     """
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(self, hass: HomeAssistant, clock: Clock) -> None:
         self.hass = hass
+        self.clock = clock
         self.offset = timedelta()
 
     def __call__(self) -> datetime:
@@ -91,14 +93,15 @@ class WallClock:
         # Firing timers early would also expire in-flight TX_RESULT waits.
         await asyncio.sleep(0.1)
         self.offset += delta
+        self.clock.advance(int(delta.total_seconds() * 1000))
         async_fire_time_changed(self.hass, self())
         await self.hass.async_block_till_done()
 
 
 @pytest.fixture
-def wall(hass: HomeAssistant) -> Generator[WallClock]:
+def wall(hass: HomeAssistant, clock: Clock) -> Generator[WallClock]:
     """Control the server's wall clock (last seen, supervision)."""
-    c = WallClock(hass)
+    c = WallClock(hass, clock)
     with patch("custom_components.connect_sensors.server._utcnow", c):
         yield c
 
