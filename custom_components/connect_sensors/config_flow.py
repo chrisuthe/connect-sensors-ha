@@ -29,6 +29,7 @@ import probatio
 
 from .const import (
     CONF_DEV_EUI,
+    CONF_HEARTBEAT,
     CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
@@ -37,13 +38,25 @@ from .const import (
     CONF_REGION,
     DEFAULT_PORT,
     DOMAIN,
+    HEARTBEAT_MAX,
+    HEARTBEAT_MIN,
     REGIONS,
     SUBENTRY_DEVICE,
     SUBENTRY_PROXY,
+    default_heartbeat,
 )
 
 PORT_SELECTOR = NumberSelector(
     NumberSelectorConfig(min=1, max=65535, step=1, mode=NumberSelectorMode.BOX)
+)
+HEARTBEAT_SELECTOR = NumberSelector(
+    NumberSelectorConfig(
+        min=HEARTBEAT_MIN,
+        max=HEARTBEAT_MAX,
+        step=1,
+        mode=NumberSelectorMode.BOX,
+        unit_of_measurement="min",
+    )
 )
 
 
@@ -207,6 +220,31 @@ class DeviceSubentryFlow(ConfigSubentryFlow):
                 "device_region": self._code["region"],
                 "network_region": self._get_entry().data[CONF_REGION],
             },
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Rename the device, or tell Home Assistant its heartbeat interval."""
+        subentry = self._get_reconfigure_subentry()
+        if user_input is not None:
+            return self.async_update_and_abort(
+                self._get_entry(),
+                subentry,
+                title=user_input[CONF_NAME],
+                data={**subentry.data, CONF_HEARTBEAT: int(user_input[CONF_HEARTBEAT])},
+            )
+        heartbeat = subentry.data.get(CONF_HEARTBEAT) or default_heartbeat(
+            subentry.data[CONF_PROFILE]
+        )
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(CONF_NAME, default=subentry.title): TextSelector(),
+                    probatio.Required(CONF_HEARTBEAT, default=heartbeat): HEARTBEAT_SELECTOR,
+                }
+            ),
         )
 
     def _create(self) -> SubentryFlowResult:

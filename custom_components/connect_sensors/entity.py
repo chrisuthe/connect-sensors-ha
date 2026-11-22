@@ -45,6 +45,19 @@ class DeviceEntity(Entity):
         )
 
 
+class ReadingEntity(DeviceEntity):
+    """An entity showing one of the device's readings."""
+
+    def __init__(self, device: Device, key: str) -> None:
+        super().__init__(device, key.replace(":", "_"))
+        self._key = key
+
+    @property
+    def available(self) -> bool:
+        """Silence is never shown as a value (07 section 8.1)."""
+        return self.device.reading_available(self._key)
+
+
 class ProxyEntity(Entity):
     """An entity of one proxy, once its proxy_id is known."""
 
