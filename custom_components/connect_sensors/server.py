@@ -884,7 +884,7 @@ class NetworkServer(asyncio.DatagramProtocol):
     def device_for(self, device_id: str) -> Device | None:
         """The sensor behind a device registry id."""
         entry = dr.async_get(self.hass).async_get(device_id)
-        if entry is None or self.entry.entry_id not in entry.config_entries:
+        if entry is None or entry.config_entry_id != self.entry.entry_id:
             return None
         for domain, identifier in entry.identifiers:
             if domain == DOMAIN and identifier in self.devices:
