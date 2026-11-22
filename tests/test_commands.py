@@ -7,7 +7,7 @@ from typing import Any
 from unittest.mock import patch
 
 import connectsensors as cs
-from homeassistant.const import STATE_OFF, STATE_UNAVAILABLE
+from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import device_registry as dr
@@ -269,7 +269,8 @@ async def test_leave_given_up_after_48_hours(
 async def test_added_again_before_leave(
     hass: HomeAssistant, loaded: MockConfigEntry, proxy: SimProxy, sensor: SimSensor
 ) -> None:
-    """Adding the device back while LEAVE is outstanding drops LEAVE."""
+    """Adding the device back before it acknowledges LEAVE drops LEAVE and keeps its
+    session: the sensor never left, so it carries on paired."""
     await proxy.connect()
     await pair(hass, proxy, sensor)
     subentry = loaded.subentries["device1"]
@@ -278,6 +279,74 @@ async def test_added_again_before_leave(
     hass.config_entries.async_add_subentry(loaded, subentry)
     await hass.async_block_till_done()
     assert server_of(loaded).leaving == {}
-    # Its old session is gone with the record: it pairs again from SCANNED.
-    proxy.uplink(sensor.uplink(cs.T_HEARTBEAT, full_state(0)))
-    await proxy.nothing()
+
+    dl = await uplink_answered(
+        hass, proxy, sensor, cs.T_DATA_CONFIRMED, readings=cs.encode_reading(0, 0x01, 1)
+    )
+    assert dl["parsed"] == []
+    assert state_of(hass, DOOR).state == STATE_ON
+
+
+async def test_pending_when_more_remain(
+    hass: HomeAssistant, loaded: MockConfigEntry, proxy: SimProxy, sensor: SimSensor
+) -> None:
+    """Commands beyond 55 bytes wait for the next downlink, flagged PENDING (02 10.1)."""
+    await proxy.connect()
+    entry = loaded.runtime_data
+    await pair(hass, proxy, sensor)
+    device = entry.devices[DEV_EUI]
+    # Ten SET_VALUEs of 6 bytes each: nine fit in 55 bytes.
+    for channel in range(10):
+        assert await entry.async_queue(
+            device,
+            "set_value",
+            f"value_{channel}",
+            0x40,
+            cs.encode_reading(channel, 0x40, 2000 + channel),
+        )
+    dl = await uplink_answered(hass, proxy, sensor)
+    assert len(dl["parsed"]) == 9
+    assert dl["flags"] & cs.DF_PENDING
+    dl = await uplink_answered(hass, proxy, sensor, uflags=cs.UF_DL_ACK)
+    assert dl["parsed"] == [(0x40, cs.encode_reading(9, 0x40, 2009))]
+    assert not dl["flags"] & cs.DF_PENDING
+    await uplink_unanswered(hass, proxy, sensor, uflags=cs.UF_DL_ACK)
+    assert device.commands == []
+
+
+async def test_send_counted_only_when_transmitted(
+    hass: HomeAssistant, loaded: MockConfigEntry, proxy: SimProxy, sensor: SimSensor
+) -> None:
+    """An answer no proxy could transmit does not count towards giving up."""
+    await proxy.connect()
+    await pair(hass, proxy, sensor)
+    with patch("custom_components.connect_sensors.server.COMMAND_MAX_SENDS", 2):
+        await set_heartbeat(hass, loaded, 2)
+        # Uncertain timestamps rule the only proxy out of RX1, and an unconfirmed
+        # uplink has no RX2 (08 section 7).
+        for _ in range(4):
+            proxy.uplink(sensor.uplink(cs.T_HEARTBEAT, full_state(0)), flags=cs.UPF_TS_UNCERTAIN)
+            await proxy.nothing()
+        await hass.async_block_till_done()
+        assert state_of(hass, COMMAND).state == "pending"
+        dl = await uplink_answered(hass, proxy, sensor)
+        assert dl["parsed"] == [SET_HEARTBEAT_2]
+
+
+async def test_longer_heartbeat_not_unreachable(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    wall: WallClock,
+) -> None:
+    """A longer heartbeat is allowed for from when it is queued: the sensor applies it
+    on receipt and acknowledges it one new interval later."""
+    await proxy.connect()
+    await pair(hass, proxy, sensor)
+    await set_heartbeat(hass, loaded, 120)
+    dl = await uplink_answered(hass, proxy, sensor)
+    assert dl["parsed"] == [(cs.CMD_SET_HEARTBEAT, (120).to_bytes(2, "big"))]
+    # Past 3 x 30 + 5 minutes, still within 3 x 120 + 5.
+    await wall.advance(timedelta(minutes=120))
+    assert state_of(hass, DOOR).state == STATE_OFF
