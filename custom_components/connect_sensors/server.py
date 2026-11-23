@@ -40,7 +40,6 @@ from .const import (
     COMMANDS_MAX_BYTES,
     CONF_DEV_EUI,
     CONF_HEARTBEAT,
-    CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
     CONF_PROFILE,
@@ -50,6 +49,7 @@ from .const import (
     EVENT_DEVICE_REACHABLE,
     EVENT_DEVICE_UNREACHABLE,
     EVENT_READING,
+    EXCHANGED_TIMEOUT_S,
     LEAVE_EXPIRY_H,
     PROXY_TIMEOUT_S,
     REGIONS,
@@ -87,6 +87,8 @@ STORAGE_VERSION = 1
 # Root downlink counters outlive devices and the config entry (02 section 8.4).
 ROOT_STORAGE_KEY = f"{DOMAIN}.root_counters"
 STATE_STORAGE_KEY = f"{DOMAIN}.state"
+# 2: connectsensors 0.4.0. Sessions from 0.3.x are gone (see _migrate_state).
+STATE_STORAGE_VERSION = 2
 
 CONFIRMED_TYPES = frozenset({cs.T_DATA_CONFIRMED, cs.T_HEARTBEAT_CONFIRMED, cs.T_JOIN, cs.T_SYNC})
 TICK = timedelta(seconds=5)
@@ -94,14 +96,20 @@ TX_HISTORY = 20
 HOUR_MS = 3_600_000
 SINGLE_PATH_WINDOW = timedelta(hours=SINGLE_PATH_WINDOW_H)
 SINGLE_PATH_REPAIR = timedelta(hours=SINGLE_PATH_REPAIR_H)
-DEVICE_ISSUES = ("pairing_stalled", "device_unreachable", "single_path")
+DEVICE_ISSUES = ("pairing_stalled", "device_unreachable", "single_path", "re_pair")
 PROXY_ISSUES = ("proxy_mismatch", "shared_key")
 COMMAND_EXPIRY = timedelta(hours=COMMAND_EXPIRY_H)
 LEAVE_EXPIRY = timedelta(hours=LEAVE_EXPIRY_H)
+EXCHANGED_TIMEOUT = timedelta(seconds=EXCHANGED_TIMEOUT_S)
 
 
 def _now_ms() -> int:
     return time.monotonic_ns() // 1_000_000
+
+
+def _unix() -> int:
+    """Unix time: epochs, tags and server_time (02 section 6.1)."""
+    return int(time.time())
 
 
 def _utcnow() -> datetime:
@@ -320,6 +328,11 @@ class Device:
         self.rssi: float | None = None
         self.snr: float | None = None
         self.stalled = False
+        # When the device last entered EXCHANGED, for its 2-minute timeout (04 4.2).
+        self.exchanged_at: datetime | None = None
+        # Paired before connectsensors 0.4.0: the sensor lost that pairing when its
+        # firmware was upgraded, and has to be paired again.
+        self.re_pair = False
         # Supervision (07 section 8). stale: readings not heard since the device was
         # last unreachable, shown as unavailable until an uplink carries them again.
         self.unreachable = False
@@ -406,6 +419,13 @@ class Device:
         self.fcnt_down = 0
         self.fcnt_down_reserved = 0
 
+    def clear_session(self) -> None:
+        """Forget the session keys. A pending exchange stays with the JoinResponder."""
+        self.k_session = None
+        self.session_keys = None
+        self.fcnt_down = 0
+        self.fcnt_down_reserved = 0
+
     def to_store(self) -> dict[str, Any]:
         """The persisted record (07 section 2.2)."""
         pending = self.join.pending
@@ -417,6 +437,8 @@ class Device:
             "seen": sorted(self.uplinks.counter.seen),
             "pending": pending.to_dict() if pending is not None else None,
             "stalled": self.stalled,
+            "exchanged_at": self.exchanged_at.isoformat() if self.exchanged_at else None,
+            "re_pair": self.re_pair,
             "readings": self.readings,
             "sw_version": self.sw_version,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
@@ -447,7 +469,6 @@ class Device:
             self.fcnt_down_reserved = d["fcnt_down_reserved"]
             self.fcnt_down = max(0, self.fcnt_down_reserved - 1)
         self.uplinks = cs.UplinkCollector(d["last_fcnt"], d["seen"])
-        # Records from before 0.3.0 lack "sent"; from_dict counts their JOINs as before.
         pending = cs.PendingExchange.from_dict(p) if (p := d["pending"]) is not None else None
         self.join = cs.JoinResponder(
             self.join.k_root,
@@ -457,6 +478,8 @@ class Device:
             count_after_sent=True,
         )
         self.stalled = d["stalled"]
+        self.exchanged_at = _parse_time(d.get("exchanged_at"))
+        self.re_pair = d.get("re_pair", False)
         self.readings = d["readings"]
         self.sw_version = d["sw_version"]
         self.last_seen = _parse_time(d["last_seen"])
@@ -480,6 +503,51 @@ class Device:
         self.last_command = d.get("last_command")
 
 
+def _migrate_state(data: dict[str, Any]) -> dict[str, Any]:
+    """State stored by connectsensors 0.3.x (storage version 1).
+
+    0.4.0 changed tags and pairing, and the sensor firmware built on it drops the
+    pairing it stored. So every session here is void: each device goes back to
+    SCANNED, and one that was paired is flagged for re-pairing. Its uplink counter
+    restarts, so its JOIN is accepted whatever counter the new firmware resumes
+    from. Root downlink counters live in their own store and are kept (02 8.4).
+    Leaving devices are dropped: their LEAVE could only go out under the old keys.
+    """
+    devices = {
+        eui: rec
+        | {
+            "state": STATE_SCANNED,
+            "k_session": None,
+            "fcnt_down_reserved": 0,
+            "last_fcnt": 0,
+            "seen": [],
+            "pending": None,
+            "stalled": False,
+            "exchanged_at": None,
+            "re_pair": rec.get("state") == STATE_PAIRED,
+            "unreachable": False,
+            # Shown as unavailable until the device is paired and heard again.
+            "stale": sorted(rec.get("readings", {})),
+            "single_path_since": None,
+            "commands": [],
+            "in_flight": None,
+        }
+        for eui, rec in data.get("devices", {}).items()
+    }
+    return {"proxies": data.get("proxies", {}), "devices": devices, "leaving": {}}
+
+
+class _StateStore(Store[dict[str, Any]]):
+    """The state store, migrated on load."""
+
+    async def _async_migrate_func(
+        self, old_major_version: int, old_minor_version: int, old_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        if old_major_version < 2:
+            return _migrate_state(old_data)
+        return old_data
+
+
 class NetworkServer(asyncio.DatagramProtocol):
     """One ConnectSensors network: its UDP endpoint, proxies and devices."""
 
@@ -488,7 +556,6 @@ class NetworkServer(asyncio.DatagramProtocol):
         self.entry = entry
         self.port: int = entry.data[CONF_PORT]
         self.region: str = entry.data[CONF_REGION]
-        self.k_net_route = cs.derive_net_route(bytes.fromhex(entry.data[CONF_K_NET]))
         self.proxies: dict[str, Proxy] = {}
         self.devices: dict[str, Device] = {}
         # Devices whose subentry was removed, until they acknowledge LEAVE (04 6.1).
@@ -498,18 +565,20 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._root_store: Store[dict[str, int]] = Store(
             hass, STORAGE_VERSION, ROOT_STORAGE_KEY, atomic_writes=True
         )
-        self._state_store: Store[dict[str, Any]] = Store(
-            hass, STORAGE_VERSION, STATE_STORAGE_KEY, atomic_writes=True
+        self._state_store = _StateStore(
+            hass, STATE_STORAGE_VERSION, STATE_STORAGE_KEY, atomic_writes=True
         )
         self._root_counters: dict[str, int] = {}
         self._proxy_ids: dict[str, str] = {}
         self._stored_devices: dict[str, Any] = {}
         self._transport: asyncio.DatagramTransport | None = None
-        self._tags: dict[tuple[bytes, bytes], list[Device]] = {}
+        self._tags = cs.TagTable()
         self._tag_epoch: int | None = None
         self._tag_time: int = 0
+        # The tag block of each device's last_fcnt in the table (07 section 3).
+        self._tag_blocks: dict[str, bytes] = {}
         self._collecting: dict[bytes, Transmission] = {}
-        self._identified: dict[bytes, tuple[Device, str, int]] = {}
+        self._identified: dict[bytes, tuple[Device, int]] = {}
         self._bootstrap: deque[int] = deque()
         self._tasks: set[asyncio.Task[None]] = set()
         self._unsub_tick: CALLBACK_TYPE | None = None
@@ -523,6 +592,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._started = _utcnow()
         self._started_ms = _now_ms()
         self.foreign_frames = 0
+        # Bootstrap frames identified by trial decryption (02 section 11.3).
+        self.trial_decryptions = 0
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -749,41 +820,36 @@ class NetworkServer(asyncio.DatagramProtocol):
     # ------------------------------------------------------------------ tags
 
     def _rebuild_tags(self) -> None:
-        """The tag table for epochs e-1, e, e+1 (07 section 3)."""
-        now = int(time.time())
-        e = cs.epoch_of(now)
-        table: dict[tuple[bytes, bytes], list[Device]] = {}
-        for _, device in self._all_devices():
-            if device.session_keys is None:
-                continue
-            for epoch in (e - 1, e, e + 1):
-                key = (
-                    cs.net_tag(self.k_net_route, epoch),
-                    cs.dev_tag(device.session_keys.k_dev_tag, epoch),
-                )
-                table.setdefault(key, []).append(device)
-        self._tags = table
-        self._tag_epoch = e
+        """The whole tag table, for the current epoch (07 section 3)."""
+        now = _unix()
+        self._tags = cs.TagTable()
+        self._tag_blocks.clear()
+        self._tag_epoch = cs.epoch_of(now)
         self._tag_time = now
+        for _, device in self._all_devices():
+            self._update_tags(device)
 
-    def net_tags(self) -> list[bytes]:
-        """The net_tags this server owns, for SERVER_STATUS (05 section 5.3)."""
-        e = cs.epoch_of(int(time.time()))
-        return [cs.net_tag(self.k_net_route, x) for x in (e - 1, e, e + 1)]
+    def _update_tags(self, device: Device) -> None:
+        """One device's entries: the normal tags of epochs e-1 to e+1 and the SYNC tags
+        around its last_fcnt, under its session keys while EXCHANGED or PAIRED."""
+        if device.session_keys is None or device.state not in (STATE_EXCHANGED, STATE_PAIRED):
+            self._tags.remove(device.eui)
+            self._tag_blocks.pop(device.eui, None)
+            return
+        assert self._tag_epoch is not None
+        self._tags.update(
+            device.eui, device.session_keys.k_dev_tag, self._tag_epoch, device.last_fcnt
+        )
+        self._tag_blocks[device.eui] = _tag_block(device.last_fcnt)
 
     @callback
     def _tick(self, _now: datetime) -> None:
-        now = int(time.time())
+        now = _unix()
         e = cs.epoch_of(now)
         jumped = abs(now - self._tag_time - TICK.total_seconds()) > 60
         if e != self._tag_epoch or jumped:
+            # Proxies hold no tags, so nothing is sent at the boundary (05 5.3).
             self._rebuild_tags()
-            # Tell connected proxies the new tags within 10 s of the boundary.
-            for proxy in self.proxies.values():
-                if proxy.connected:
-                    self._send(
-                        proxy, cs.M_SERVER_STATUS, cs.server_status_body(now, self.net_tags())
-                    )
         else:
             self._tag_time = now
         for proxy in self.proxies.values():
@@ -799,6 +865,14 @@ class NetworkServer(asyncio.DatagramProtocol):
             self._expire_commands(device, now)
         for device in self.devices.values():
             changed = self._expire_commands(device, now)
+            if (
+                device.state == STATE_EXCHANGED
+                and device.exchanged_at is not None
+                and now - device.exchanged_at >= EXCHANGED_TIMEOUT
+            ):
+                self._exchange_timed_out(device)
+                self._save_soon()  # a state change (07 section 10)
+                changed = True
             for sid in [s for s, t in device.heard_by.items() if now - t >= SINGLE_PATH_WINDOW]:
                 del device.heard_by[sid]
                 changed = True
@@ -827,6 +901,17 @@ class NetworkServer(asyncio.DatagramProtocol):
                 async_dispatcher_send(self.hass, signal_device_update(device.eui))
 
     @callback
+    def _exchange_timed_out(self, device: Device) -> None:
+        """No uplink under the pending k_session verified in 2 minutes: back to SCANNED,
+        and the pending k_session is no longer recognized (04 section 4.2). The pending
+        exchange is kept, so a retransmitted JOIN still gets the same answer."""
+        device.state = STATE_SCANNED
+        device.exchanged_at = None
+        device.clear_session()
+        self._update_tags(device)
+        _LOGGER.info("%s: pairing timed out; press its button again", device.name)
+
+    @callback
     def _device_issues(self, device: Device, now: datetime) -> None:
         """Raise or clear the device's repair issues to match its state."""
         eui, name = device.eui, device.name
@@ -851,6 +936,12 @@ class NetworkServer(asyncio.DatagramProtocol):
             proxy = self.proxies.get(sids[0]) if sids else None
             single_path = {"name": name, "proxy": proxy.name if proxy else "-"}
         self._set_issue("single_path", eui, single_path)
+        self._set_issue(
+            "re_pair",
+            eui,
+            {"name": name} if device.re_pair and device.state != STATE_PAIRED else None,
+            fix={"entry_id": self.entry.entry_id, "dev_eui": eui},
+        )
 
     @callback
     def _set_issue(
@@ -1211,8 +1302,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._check_keys()
         if proxy.proxy_id is not None and (previous is None or previous["fw"] != hello["fw"]):
             self._set_sw_version(proxy.proxy_id.hex(), hello["fw"])
-        now = int(time.time())
-        self._send(proxy, cs.M_SERVER_STATUS, cs.server_status_body(now, self.net_tags(), m["seq"]))
+        now = _unix()
+        self._send(proxy, cs.M_SERVER_STATUS, cs.server_status_body(now, m["seq"]))
         async_dispatcher_send(self.hass, signal_proxy_update(proxy.subentry_id))
 
     def _tx_result(self, proxy: Proxy, body: bytes) -> None:
@@ -1260,6 +1351,10 @@ class NetworkServer(asyncio.DatagramProtocol):
             return
         device, keys, plaintext = identified
         got = device.uplinks.receive(frame, now_ms)
+        block = self._tag_blocks.get(device.eui)
+        if block is not None and block != _tag_block(device.last_fcnt):
+            # last_fcnt moved into a new block: move the SYNC tags along (07 3).
+            self._update_tags(device)
         if got.get("counter") != "too_old":  # copies have no counter verdict
             new_path = proxy.subentry_id not in device.heard_by
             device.heard_by[proxy.subentry_id] = _utcnow()
@@ -1287,56 +1382,73 @@ class NetworkServer(asyncio.DatagramProtocol):
     ) -> tuple[Device, cs.DeviceKeys, bytes] | None:
         """07 section 4, step 4. Copies reuse the first copy's identification."""
         self._identified = {
-            f: v for f, v in self._identified.items() if now_ms - v[2] < cs.FRAME_MEMORY_MS
+            f: v for f, v in self._identified.items() if now_ms - v[1] < cs.FRAME_MEMORY_MS
         }
-        if (known := self._identified.get(frame)) is not None:
-            device, keyset, _ = known
-            keys = self._keys_for(device, h.ftype, keyset)
-            if keys is not None:
-                try:
-                    _, plaintext = cs.open_frame(keys, frame)
-                except Exception:  # InvalidTag or ValueError: not this device
-                    pass
-                else:
-                    return device, keys, plaintext
+        known = self._identified.get(frame)
+        if known is not None and (opened := self._try(known[0], frame, h.ftype)) is not None:
+            return opened
 
-        bootstrap = h.net_tag == cs.ZERO_TAG and h.dev_tag == cs.ZERO_TAG
-        candidates: list[tuple[Device, str]]
-        if not bootstrap:
-            candidates = [(d, "session") for d in self._tags.get((h.net_tag, h.dev_tag), [])]
-        else:
-            # Spec 02 section 11.3: at most 50 bootstrap frames a minute.
-            while self._bootstrap and now_ms - self._bootstrap[0] > 60_000:
-                self._bootstrap.popleft()
-            if len(self._bootstrap) >= BOOTSTRAP_PER_MINUTE:
-                return None
-            self._bootstrap.append(now_ms)
-            keyset = "root" if h.ftype == cs.T_JOIN else "session"
-            candidates = [(d, keyset) for _, d in self._all_devices()]
-        for device, keyset in candidates:
-            keys = self._keys_for(device, h.ftype, keyset)
-            if keys is None:
+        # Every proxy here is the server's own, so every frame is heard locally.
+        route, euis = cs.identify_route(self._tags, frame, local=True)
+        tried: list[Device] = []
+        for eui in euis:
+            if (device := self._device(eui)) is None:
                 continue
-            try:
-                _, plaintext = cs.open_frame(keys, frame)
-            except Exception:  # trial decryption: try the next device
-                continue
-            self._identified[frame] = (device, keyset, now_ms)
-            return device, keys, plaintext
+            tried.append(device)
+            if (opened := self._try(device, frame, h.ftype)) is not None:
+                self._identified[frame] = (device, now_ms)
+                return opened
+        # A bootstrap frame that missed the table, or whose candidates all failed the
+        # MIC, is tried against every device (02 section 11.3).
+        if cs.is_bootstrap(h.ftype) and route != "drop":
+            if not self._bootstrap_allowed(now_ms):
+                return None  # dropped unprocessed (07 section 4, step 4)
+            for _, device in self._all_devices():
+                if device in tried:
+                    continue
+                if (opened := self._try(device, frame, h.ftype)) is not None:
+                    self.trial_decryptions += 1
+                    _LOGGER.debug("%s: frame %s found by trial decryption", device.name, h.fcnt)
+                    self._identified[frame] = (device, now_ms)
+                    return opened
         self.foreign_frames += 1
         return None
 
+    def _bootstrap_allowed(self, now_ms: int) -> bool:
+        """At most 50 bootstrap frames a minute are trial-decrypted (02 section 11.3)."""
+        while self._bootstrap and now_ms - self._bootstrap[0] > 60_000:
+            self._bootstrap.popleft()
+        if len(self._bootstrap) >= BOOTSTRAP_PER_MINUTE:
+            return False
+        self._bootstrap.append(now_ms)
+        return True
+
+    def _device(self, eui: str) -> Device | None:
+        return self.devices.get(eui) or self.leaving.get(eui)
+
     @staticmethod
-    def _keys_for(device: Device, ftype: int, keyset: str) -> cs.DeviceKeys | None:
-        """The key set a frame type may use for a device in its current state."""
+    def _keys(device: Device, ftype: int) -> cs.DeviceKeys | None:
+        """The key set a frame type may use for this device now: the root keys for a
+        JOIN while waiting to be paired, else the session keys while EXCHANGED or
+        PAIRED (02 section 11.3)."""
         if ftype == cs.T_JOIN:
-            # JOIN: root keys of devices waiting to be paired (02 section 11.3).
-            if keyset == "root" and device.state in (STATE_SCANNED, STATE_EXCHANGED):
-                return device.root_keys
-            return None
-        if keyset == "session" and device.state in (STATE_EXCHANGED, STATE_PAIRED):
+            return device.root_keys if device.state in (STATE_SCANNED, STATE_EXCHANGED) else None
+        if device.state in (STATE_EXCHANGED, STATE_PAIRED):
             return device.session_keys
         return None
+
+    @classmethod
+    def _try(
+        cls, device: Device, frame: bytes, ftype: int
+    ) -> tuple[Device, cs.DeviceKeys, bytes] | None:
+        """Open the frame with the key set its type may use for this device."""
+        if (keys := cls._keys(device, ftype)) is None:
+            return None
+        try:
+            _, plaintext = cs.open_frame(keys, frame)
+        except Exception:  # InvalidTag or ValueError: not this device
+            return None
+        return device, keys, plaintext
 
     async def _process(self, tx: Transmission) -> None:
         """Act on a transmission, then answer it after the collection window."""
@@ -1361,6 +1473,11 @@ class NetworkServer(asyncio.DatagramProtocol):
     async def _act(self, tx: Transmission) -> bytes | None:
         """07 section 4, steps 6 and 7. Returns the downlink to send, if any."""
         device, h = tx.device, tx.header
+        if self._keys(device, h.ftype) is not tx.keys:
+            # The keys it verified under were dropped while it waited for the lock:
+            # the exchange timed out or was replaced.
+            _LOGGER.debug("%s: frame %s is under keys no longer in use", device.name, h.fcnt)
+            return None
         fresh = tx.counter in ("accept", "accept_late")
         if fresh:
             best = max(tx.receptions, key=lambda r: r.snr)
@@ -1374,21 +1491,21 @@ class NetworkServer(asyncio.DatagramProtocol):
 
         uflags = tx.plaintext[0]
         commands = b""
-        if device.state == STATE_EXCHANGED and h.ftype == cs.T_SYNC:
-            # 04 section 4.4, step 6.
-            commands = cs.command(cs.CMD_SET_NETWORK, self.k_net_route)
-        elif (
-            device.state == STATE_EXCHANGED
-            and fresh
-            and h.net_tag != cs.ZERO_TAG
-            and uflags & cs.UF_DL_ACK
-        ):
-            # Step 7: an uplink with normal tags acknowledges SET_NETWORK.
+        if device.state == STATE_EXCHANGED and fresh:
+            # 04 section 4.4, step 6: the first uplink under the pending k_session
+            # verified. Its DL_ACK, if set, acknowledges KEY_EXCHANGE (07 section 7),
+            # which is no queued command. Answering it completes pairing on the sensor.
             device.state = STATE_PAIRED
             device.join.paired()
+            device.exchanged_at = None
+            device.re_pair = False
             self._clear_stall(device)
+            self._set_issue("re_pair", device.eui, None)
+            self._update_tags(device)
             _LOGGER.info("%s paired", device.name)
-            await self._async_save()
+            # PAIRED and k_session are on disk before the answer (04 section 4.6).
+            if not await self._async_save():
+                return None
 
         queued = device.state == STATE_PAIRED
         self._settle(device, h.fcnt, tx.counter, bool(uflags & cs.UF_DL_ACK))
@@ -1411,9 +1528,6 @@ class NetworkServer(asyncio.DatagramProtocol):
             dflags = cs.DF_PENDING if more else 0
         if not (tx.answer or taken or (fresh and uflags & cs.UF_TIME_UNSURE)):
             return None
-        # The device record must be on disk before SET_NETWORK goes out (04 section 4.6).
-        if commands and not taken and not await self._async_save():
-            return None
         assert device.session_keys is not None
         fcnt = await self._next_fcnt_down(device)
         if fcnt is None:
@@ -1429,24 +1543,26 @@ class NetworkServer(asyncio.DatagramProtocol):
                 ", ".join(c.name for c in taken),
                 h.fcnt,
             )
+        # The answer carries the uplink's tag (02 section 6.1).
         return cs.seal(
             device.session_keys,
             cs.T_DOWNLINK,
-            h.net_tag,
-            h.dev_tag,
+            h.tag,
             fcnt,
-            cs.downlink_payload(h.fcnt, int(time.time()), dflags, commands),
+            cs.downlink_payload(h.fcnt, _unix(), dflags, commands),
         )
 
     async def _join(self, tx: Transmission) -> bytes | None:
         """Answer a JOIN (07 section 5.1)."""
         device = tx.device
-        r = device.join.join(tx.frame, secrets.token_bytes(32), int(time.time()))
+        r = device.join.join(tx.frame, secrets.token_bytes(32), _unix())
         if r["action"] == "new_exchange":
             device.set_session(r["k_session"])
             device.state = STATE_EXCHANGED
+            device.exchanged_at = _utcnow()
             self._clear_stall(device)
-            self._rebuild_tags()
+            # The first session uplink is found by its tags (07 section 3).
+            self._update_tags(device)
             # Root counter and pending exchange are on disk before KEY_EXCHANGE is sent.
             if not await self._async_save():
                 return None
@@ -1686,6 +1802,12 @@ class NetworkServer(asyncio.DatagramProtocol):
             },
             "root_counters": dict(self._root_data()),
         }
+
+
+def _tag_block(fcnt: int) -> bytes:
+    """The bootstrap tag block holding an uplink counter value (02 section 6.1). A
+    device with no uplink yet counts as block 0, as in the tag table."""
+    return cs.block_index(max(fcnt, 1))
 
 
 def _best(receptions: list[Reception]) -> Reception:

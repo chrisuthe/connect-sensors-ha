@@ -18,7 +18,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.connect_sensors.const import (
     CONF_DEV_EUI,
     CONF_HEARTBEAT,
-    CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
     CONF_PAIRING_CODE,
@@ -59,7 +58,8 @@ async def test_network(hass: HomeAssistant) -> None:
     data = result["data"]
     assert data[CONF_REGION] == "US915"
     assert data[CONF_PORT] == 47801
-    assert re.fullmatch("[0-9a-f]{32}", data[CONF_K_NET])
+    # No network key since connectsensors 0.4.0 (02 section 5.2).
+    assert data == {CONF_REGION: "US915", CONF_PORT: 47801}
 
     # One network per Home Assistant.
     result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
@@ -68,8 +68,7 @@ async def test_network(hass: HomeAssistant) -> None:
 
 
 async def test_reconfigure_port(hass: HomeAssistant, loaded: MockConfigEntry) -> None:
-    """A new port reloads the server on it; the network key stays."""
-    k_net = loaded.data[CONF_K_NET]
+    """A new port reloads the server on it; the region stays."""
     new_port = free_udp_port()
     result = await loaded.start_reconfigure_flow(hass)
     result = await hass.config_entries.flow.async_configure(
@@ -78,7 +77,7 @@ async def test_reconfigure_port(hass: HomeAssistant, loaded: MockConfigEntry) ->
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reconfigure_successful"
     await hass.async_block_till_done()
-    assert loaded.data[CONF_K_NET] == k_net
+    assert loaded.data[CONF_REGION] == "US915"
     assert loaded.runtime_data.port == new_port
 
 

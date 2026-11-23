@@ -30,7 +30,6 @@ import probatio
 from .const import (
     CONF_DEV_EUI,
     CONF_HEARTBEAT,
-    CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
     CONF_PAIRING_CODE,
@@ -94,17 +93,16 @@ def new_proxy_key(entry: ConfigEntry) -> str:
 class ConnectSensorsConfigFlow(ConfigFlow, domain=DOMAIN):
     """Create the network."""
 
-    VERSION = 1
+    VERSION = 2
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Choose the region profile and port; the network key is generated."""
+        """Choose the region profile and port."""
         if user_input is not None:
             return self.async_create_entry(
                 title="ConnectSensors",
                 data={
                     CONF_REGION: user_input[CONF_REGION].upper(),
                     CONF_PORT: int(user_input[CONF_PORT]),
-                    CONF_K_NET: secrets.token_hex(16),
                 },
             )
         return self.async_show_form(
@@ -126,7 +124,7 @@ class ConnectSensorsConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Change the UDP port. The region and network key stay."""
+        """Change the UDP port. The region stays."""
         entry = self._get_reconfigure_entry()
         if user_input is not None:
             return self.async_update_and_abort(

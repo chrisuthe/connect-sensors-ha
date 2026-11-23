@@ -19,7 +19,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry, async_
 
 from custom_components.connect_sensors.const import (
     CONF_DEV_EUI,
-    CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
     CONF_PROFILE,
@@ -31,13 +30,12 @@ from custom_components.connect_sensors.const import (
 
 from .sim import SimProxy, SimSensor, free_udp_port
 
-K_NET = "f0e1d2c3b4a5968778695a4b3c2d1e0f"
 PROXY_KEY = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
 PROXY_ID = bytes.fromhex("348518fffe000001")
 DEV_EUI = "c5c5000000000001"
 K_ROOT = "000102030405060708090a0b0c0d0e0f"
 PAIRING_CODE = cs.qr_encode(bytes.fromhex(DEV_EUI), bytes.fromhex(K_ROOT), "US915", "CS.CONTACT-1")
-SECRETS = (K_NET, PROXY_KEY, K_ROOT, PAIRING_CODE)
+SECRETS = (PROXY_KEY, K_ROOT, PAIRING_CODE)
 
 
 @pytest.fixture(autouse=True)
@@ -111,8 +109,9 @@ def entry(port: int) -> MockConfigEntry:
     """The network, with one proxy and one device in SCANNED."""
     return MockConfigEntry(
         domain=DOMAIN,
+        version=2,
         title="ConnectSensors",
-        data={CONF_REGION: "US915", CONF_PORT: port, CONF_K_NET: K_NET},
+        data={CONF_REGION: "US915", CONF_PORT: port},
         subentries_data=[
             {
                 "data": {CONF_KEY: PROXY_KEY},

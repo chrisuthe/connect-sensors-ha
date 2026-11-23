@@ -16,7 +16,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.connect_sensors import server
 from custom_components.connect_sensors.const import (
     CONF_DEV_EUI,
-    CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
     CONF_PROFILE,
@@ -27,7 +26,7 @@ from custom_components.connect_sensors.const import (
 )
 
 from .common import full_state, pair
-from .conftest import DEV_EUI, K_NET, K_ROOT
+from .conftest import DEV_EUI, K_ROOT
 from .sim import SimProxy, SimSensor, downlink_body
 
 # Name, key, proxy_id, base of its rx_time_us (so a DOWNLINK shows which copy it targets).
@@ -45,8 +44,9 @@ def entry(port: int) -> MockConfigEntry:
     """The network, with proxies a, b and c and one device."""
     return MockConfigEntry(
         domain=DOMAIN,
+        version=2,
         title="ConnectSensors",
-        data={CONF_REGION: "US915", CONF_PORT: port, CONF_K_NET: K_NET},
+        data={CONF_REGION: "US915", CONF_PORT: port},
         subentries_data=[
             *(
                 {

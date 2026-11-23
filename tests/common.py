@@ -7,7 +7,6 @@ from typing import Any
 import connectsensors as cs
 from homeassistant.core import HomeAssistant
 
-from .conftest import K_NET
 from .sim import SimProxy, SimSensor, downlink_body
 
 
@@ -33,16 +32,15 @@ async def answer(proxy: SimProxy, rx_time_us: int) -> bytes:
 
 
 async def pair(hass: HomeAssistant, proxy: SimProxy, sensor: SimSensor) -> dict[str, Any]:
-    """JOIN, KEY_EXCHANGE, SYNC, SET_NETWORK, then a heartbeat (04 section 4.4)."""
+    """JOIN, KEY_EXCHANGE, then the first session uplink, whose answer completes
+    pairing on the sensor (04 section 4.4)."""
     rx = proxy.uplink(sensor.join())
     assert sensor.key_exchange(await answer(proxy, rx)) == "accept"
-    rx = proxy.uplink(sensor.sync())
-    set_network = sensor.downlink(await answer(proxy, rx))
-    assert set_network["commands"][0] == cs.CMD_SET_NETWORK
-    assert sensor.k_net_route == cs.derive_net_route(bytes.fromhex(K_NET))
+    assert sensor.pairing.state == "SESSION"
     rx = proxy.uplink(sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0), cs.UF_DL_ACK))
     ack = sensor.downlink(await answer(proxy, rx))
     assert ack["reply_to"] == sensor.fcnt
+    assert sensor.pairing.state == "PAIRED"
     await hass.async_block_till_done()
     return ack
 
