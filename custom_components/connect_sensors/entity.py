@@ -108,9 +108,9 @@ class ProxyEntity(Entity):
         )
 
 
-def mailbox_device_id(server: MailboxServer) -> str:
-    """The device registry identifier of a mailbox server."""
-    return f"mailbox_{server.key}"
+def mailbox_device_id(entry_id: str, server: MailboxServer) -> str:
+    """The device registry identifier of a mailbox server, as one network uses it."""
+    return f"mailbox_{entry_id}_{server.key}"
 
 
 class MailboxEntity(Entity):
@@ -122,9 +122,10 @@ class MailboxEntity(Entity):
     def __init__(self, entry_id: str, server: MailboxServer, suffix: str) -> None:
         self.mailbox = server
         self._entry_id = entry_id
-        self._attr_unique_id = f"{entry_id}_{mailbox_device_id(server)}_{suffix}"
+        device_id = mailbox_device_id(entry_id, server)
+        self._attr_unique_id = f"{device_id}_{suffix}"
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, mailbox_device_id(server))},
+            identifiers={(DOMAIN, device_id)},
             name=f"Mailbox {server.host}",
             model="Mailbox server",
             entry_type=DeviceEntryType.SERVICE,

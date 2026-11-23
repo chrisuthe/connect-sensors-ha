@@ -95,6 +95,7 @@ STATE_STORAGE_VERSION = 2
 
 CONFIRMED_TYPES = frozenset({cs.T_DATA_CONFIRMED, cs.T_HEARTBEAT_CONFIRMED, cs.T_JOIN, cs.T_SYNC})
 TICK = timedelta(seconds=5)
+AGE_CAP_MS = 1500
 TX_HISTORY = 20
 HOUR_MS = 3_600_000
 SINGLE_PATH_WINDOW = timedelta(hours=SINGLE_PATH_WINDOW_H)
@@ -625,6 +626,9 @@ class NetworkServer(asyncio.DatagramProtocol):
         # The tag block of each device's last_fcnt in the table (07 section 3).
         self._tag_blocks: dict[str, bytes] = {}
         self._collecting: dict[bytes, Transmission] = {}
+        # Confirmed transmissions none of our proxies could answer, with their answer:
+        # a neighbour's copy may still arrive in time for RX2 (07 section 4.4).
+        self._unanswered: dict[bytes, tuple[Transmission, bytes]] = {}
         self._identified: dict[bytes, tuple[Device, int]] = {}
         self._bootstrap: deque[int] = deque()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -1492,7 +1496,10 @@ class NetworkServer(asyncio.DatagramProtocol):
             return
         device, keys, plaintext = identified
         # Received age_ms before its delivery arrived (07 section 4.3).
-        got = device.uplinks.receive(frame, arrived_ms, max(r.age_ms for r in fed))
+        # The age is the publisher's claim: capped as the server caps it (09 7.2), so a
+        # retry cannot be passed off as a copy.
+        age = min(AGE_CAP_MS, max(r.age_ms for r in fed))
+        got = device.uplinks.receive(frame, arrived_ms, age)
         block = self._tag_blocks.get(device.eui)
         if block is not None and block != _tag_block(device.last_fcnt):
             self._update_tags(device)
@@ -1506,6 +1513,18 @@ class NetworkServer(asyncio.DatagramProtocol):
         if got["result"] == "copy":
             if (tx := self._collecting.get(frame)) is not None:
                 tx.fed.extend(fed)
+            elif (
+                (waiting := self._unanswered.get(frame)) is not None
+                and arrived_ms - waiting[0].started_ms < RX2_OFFSET_US // 1000
+                and self.federation is not None
+            ):
+                tx, downlink = waiting
+                tx.fed.extend(fed)
+                task = self.hass.async_create_background_task(
+                    self._request_late(tx, downlink), f"{DOMAIN} federated request {device.eui}"
+                )
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
             return
         if got["counter"] == "too_old":
             return
@@ -1513,6 +1532,10 @@ class NetworkServer(asyncio.DatagramProtocol):
             frame, h, device, keys, plaintext, got["counter"], got["answer"], arrived_ms, [], fed
         )
         self._start(tx)
+
+    async def _request_late(self, tx: Transmission, downlink: bytes) -> None:
+        if self.federation is not None and await self.federation.request(tx, downlink, tx.carries):
+            self._unanswered.pop(tx.frame, None)
 
     def _identify(
         self, frame: bytes, h: cs.ParsedHeader, now_ms: int, local: bool = True
@@ -1893,10 +1916,17 @@ class NetworkServer(asyncio.DatagramProtocol):
                     "%s: no proxy can answer frame %s in RX1", tx.device.name, tx.header.fcnt
                 )
             return
-        if not candidates and not rx1 and tx.fed and self.federation is not None:
+        if not candidates and not rx1 and self.federation is not None:
             # None of our proxies can answer: one federated RX2 request, never both
-            # (07 sections 4.4 and 6.3).
-            await self.federation.request(tx, downlink, tx.carries)
+            # (07 sections 4.4 and 6.3). Copies that come later may still make it.
+            if not (tx.fed and await self.federation.request(tx, downlink, tx.carries)):
+                now_ms = _now_ms()
+                self._unanswered = {
+                    f: v
+                    for f, v in self._unanswered.items()
+                    if now_ms - v[0].started_ms < RX2_OFFSET_US // 1000
+                }
+                self._unanswered[tx.frame] = (tx, downlink)
             return
         if not candidates:
             _LOGGER.debug(

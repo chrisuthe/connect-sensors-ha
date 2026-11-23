@@ -17,6 +17,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
+from .entity import mailbox_device_id
 from .server import STATE_STORAGE_KEY, STATE_STORAGE_VERSION, NetworkServer
 from .services import async_setup_services
 
@@ -70,7 +71,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEntr
 def _remove_old_mailboxes(hass: HomeAssistant, entry: ConnectSensorsConfigEntry) -> None:
     """Drop the devices of mailbox servers no longer in use."""
     federation = entry.runtime_data.federation
-    keep = {f"mailbox_{s.key}" for s in federation.servers.values()} if federation else set()
+    servers = federation.servers.values() if federation else ()
+    keep = {mailbox_device_id(entry.entry_id, s) for s in servers}
     registry = dr.async_get(hass)
     for device in dr.async_entries_for_config_entry(registry, entry.entry_id):
         ids = {i for d, i in device.identifiers if d == DOMAIN}

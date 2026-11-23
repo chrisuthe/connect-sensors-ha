@@ -724,3 +724,62 @@ async def test_options_flow(hass: HomeAssistant, loaded: MockConfigEntry) -> Non
     assert loaded.options[CONF_MAILBOX_SERVERS] == ["wss://mailbox.example/"]
     assert loaded.options[CONF_FEDERATION_PUBLISH] is True
     assert loaded.options[CONF_FEDERATION_OWNER] is False
+
+
+async def test_downlinks_alone_do_not_connect(hass: HomeAssistant, mailbox: Mailbox) -> None:
+    """Federated downlinks answer only what was published: alone, they connect nothing."""
+    entry = home_entry(
+        free_udp_port(),
+        PROXY_KEY,
+        {CONF_MAILBOX_SERVERS: [mailbox.url], CONF_FEDERATION_DOWNLINKS: True},
+        device=True,
+        title="A",
+    )
+    await setup(hass, entry)
+    assert server_of(entry).federation is None
+    await asyncio.sleep(0.5)
+    assert "welcome" not in mailbox.text()
+
+
+async def test_local_copy_answers_locally(
+    hass: HomeAssistant, homes: Homes, mailbox: Mailbox
+) -> None:
+    """Heard by A's own proxy too: A answers through it, and requests nothing through
+    federation, so there is one downlink for the window (07 section 6.3)."""
+    frame = homes.sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0))
+    rx_a = homes.proxy_a.uplink(frame)
+    homes.proxy_b.uplink(frame, rssi=-98.5, snr=-3.25)
+    m = await homes.proxy_a.recv(cs.M_DOWNLINK)
+    assert downlink_body(m)["ref_rx_time_us"] == rx_a
+    device = homes.device
+    await until(lambda: device.federated_count == 1, "B's copy at A")
+    await homes.proxy_b.nothing(1.0)
+    assert "forwarded to" not in mailbox.text()
+
+
+async def test_late_federated_copy_is_answered(hass: HomeAssistant, homes: Homes) -> None:
+    """A's proxy heard the frame but cannot transmit: B's copy, arriving after A's
+    collection window, still gets the RX2 answer through B (07 section 4.4)."""
+    homes.proxy_a.hello(caps=0)
+    await until(
+        lambda: not server_of(homes.a).proxies["proxy_A"].can_downlink, "A's proxy receive-only"
+    )
+    frame = homes.sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0))
+    homes.proxy_a.uplink(frame)
+    await asyncio.sleep(0.3)  # past A's collection window
+    rx_b = homes.proxy_b.uplink(frame, rssi=-98.5, snr=-3.25)
+    await homes.rx2_via_b(rx_b)
+
+
+async def test_non_sent_result_releases_and_counts(hass: HomeAssistant, homes: Homes) -> None:
+    """B's proxy answers BUSY: the result releases the transmission and counts as a soft
+    failure for B (09 sections 7.5 and 9); there is no other reception to try."""
+    homes.proxy_b.tx_result = (2, 0)
+    homes.via_b(cs.T_HEARTBEAT_CONFIRMED)
+    await homes.proxy_b.recv(cs.M_DOWNLINK, within=5)
+    federation = federation_of(homes.a)
+    await until(lambda: any(r.failures for r in federation.records.values()), "the failure")
+    (record,) = federation.records.values()
+    assert record.failures[0][1] == 0.5
+    assert not record.credits
+    await homes.proxy_b.nothing(1.0)

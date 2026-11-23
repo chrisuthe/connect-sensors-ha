@@ -375,7 +375,7 @@
           "mailbox_servers": "The wss:// address of each mailbox server to use. Home Assistant keeps a separate key for each one.",
           "federation_owner": "Your sensors' frames heard by neighbours' proxies are delivered to you, and Home Assistant can answer them through those proxies. A device heard only this way gets queued commands with its next confirmed uplink, which can take up to its heartbeat interval.",
           "federation_publish": "Frames your proxies hear that belong to none of your devices are passed to the mailbox servers, which deliver them only to their owners. Pairing requests are never passed on.",
-          "federation_downlinks": "Neighbours can ask your proxies to transmit the replies to their sensors' frames that your proxies heard. Your own devices come first, and neighbours get at most 0.5% of each proxy's airtime.",
+          "federation_downlinks": "Neighbours can ask your proxies to transmit the replies to their sensors' frames that your proxies heard. Your own devices come first, and neighbours get at most 0.5% of each proxy's airtime. Needs *Share my coverage with neighbours*: neighbours can only ask about frames you shared.",
           "ignore_federated_events": "A neighbour's proxy or a mailbox server that is a device's only path controls when its frames arrive. Turn this on to fire no events, such as button presses, from frames that came only through federation.",
           "ignore_federated_readings": "The same for readings: keep the last value instead of one that came only through federation.",
           "mailbox_certificate": "Only for a mailbox server with a self-signed certificate: paste its certificate (PEM) to trust it, in addition to the usual certificate authorities."

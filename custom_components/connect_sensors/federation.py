@@ -75,6 +75,9 @@ PING_INTERVAL_S = 30  # 09 section 12.5
 REFRESH_INTERVAL_S = 30
 BACKOFF_MIN_S = 1.0
 BACKOFF_MAX_S = 300.0
+# A connection counts as working, and the backoff starts again from its minimum, only
+# once it has stayed up this long.
+STABLE_S = 60
 # SYNC registrations last a day and are renewed while their block stays in the
 # window (09 section 5.3 allows up to 7 days).
 SYNC_REGISTRATION_S = 86_400
@@ -214,7 +217,6 @@ class Exchange:
 
     reply_to: int
     path: str
-    reporters: set[str]
     answers: int = 1
     sent: bool = False
 
@@ -347,7 +349,10 @@ class MailboxLink:
 
     async def ping(self) -> None:
         """Measure rtt_owner (09 section 12.5)."""
-        self._pings[self.seq + 1] = self._clock()
+        now = self._clock()
+        # An unanswered ping is forgotten after a minute.
+        self._pings = {seq: at for seq, at in self._pings.items() if now - at < 60_000}
+        self._pings[self.seq + 1] = now
         await self.send([csf.MB_PING])
 
     async def recv(self) -> list[Any]:
@@ -399,6 +404,7 @@ class MailboxServer:
         self.issued: dict[bytes, Issued] = {}
         self.published: deque[int] = deque()
         self.quota: dict[bytes, tuple[float, int]] = {}  # requester -> (airtime ms, at ms)
+        self.lock = asyncio.Lock()
         self.deliveries = 0
         self.publishes = 0
         self.forwards = 0
@@ -440,7 +446,7 @@ class Federation:
         self.certificate: str | None = options.get(CONF_MAILBOX_CERTIFICATE) or None
         self.servers: dict[str, MailboxServer] = {}
         self._store: Store[dict[str, Any]] = Store(
-            hass, STORAGE_VERSION, STORAGE_KEY, atomic_writes=True
+            hass, STORAGE_VERSION, STORAGE_KEY, private=True, atomic_writes=True
         )
         self._stored: dict[str, Any] = {}
         self._context: ssl.SSLContext | None = None
@@ -466,7 +472,8 @@ class Federation:
     @property
     def enabled(self) -> bool:
         """Federation does anything at all only with an opt-in and a server."""
-        return bool(self.urls) and (self.owner or self.publish or self.downlinks)
+        # Federated downlinks alone do nothing: forwards answer what we published.
+        return bool(self.urls) and (self.owner or self.publish)
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -490,10 +497,19 @@ class Federation:
         for record in self.records.values():
             record.prune(now)
         await self._store.async_save(self._store_data())
-        self._context = await self.hass.async_add_executor_job(build_ssl_context, self.certificate)
         started = self.server.utcnow()
         for url in self.urls:
             self.servers[url] = MailboxServer(url, bytes.fromhex(keys[url]["client_seed"]), started)
+        try:
+            self._context = await self.hass.async_add_executor_job(
+                build_ssl_context, self.certificate
+            )
+        except (ssl.SSLError, ValueError) as err:
+            # The options flow checks the certificate; this is a damaged entry.
+            _LOGGER.error("The trusted mailbox certificate cannot be used: %s", err)
+            for s in self.servers.values():
+                s.last_error = f"trusted certificate: {err}"
+            return
         for s in self.servers.values():
             self._spawn(self._keep(s), f"{DOMAIN} mailbox {s.host}")
         self._spawn(self._refresher(), f"{DOMAIN} mailbox refresh")
@@ -563,7 +579,7 @@ class Federation:
             try:
                 s.link = MailboxLink(s.url, s.seed)
                 await s.link.connect(session, self._context, self.server.clock, self._verify)
-                backoff = BACKOFF_MIN_S
+                up_at = self.server.clock()
                 await self._connected(s)
                 pinger = self.hass.async_create_background_task(
                     self._pinger(s), f"{DOMAIN} mailbox ping {s.host}"
@@ -573,6 +589,8 @@ class Federation:
                         await self._on_message(s, await s.link.recv())
                 finally:
                     pinger.cancel()
+                    if self.server.clock() - up_at >= STABLE_S * 1000:
+                        backoff = BACKOFF_MIN_S
             except asyncio.CancelledError:
                 raise
             except MailboxRefused as err:
@@ -637,7 +655,10 @@ class Federation:
         """Top up registrations each epoch and as SYNC windows move (09 5.3, 5.5)."""
         while True:
             await asyncio.sleep(REFRESH_INTERVAL_S)
-            await self._refresh()
+            try:
+                await self._refresh()
+            except Exception:
+                _LOGGER.exception("Error refreshing mailbox registrations")
 
     async def _refresh(self) -> None:
         self._refresh_pending = False
@@ -649,6 +670,13 @@ class Federation:
                     await self._register(s)
                 except (ConnectionError, aiohttp.ClientError, RuntimeError) as err:
                     _LOGGER.debug("Mailbox %s: registering failed: %s", s.url, err)
+
+    async def _register(self, s: MailboxServer) -> None:
+        """One registration pass at a time per server, so two never send the same
+        entries or withdraw the same tags."""
+        async with s.lock:
+            if s.up and s.link is not None:
+                await self._register_now(s)
 
     @callback
     def devices_changed(self) -> None:
@@ -717,7 +745,7 @@ class Federation:
         self.tag_devices = devices
         return out
 
-    async def _register(self, s: MailboxServer) -> None:
+    async def _register_now(self, s: MailboxServer) -> None:
         link = s.link
         assert link is not None
         now = self.server.unix()
@@ -734,7 +762,7 @@ class Federation:
             for i in range(0, len(stale), WITHDRAW_CHUNK):
                 await link.send([csf.MB_WITHDRAW, stale[i : i + WITHDRAW_CHUNK]])
             for t in stale:
-                del s.registered[t]
+                s.registered.pop(t, None)
             _LOGGER.debug("Mailbox %s: withdrew %s tags", s.url, len(stale))
         todo = [
             t
@@ -917,8 +945,11 @@ class Federation:
         rtt = r.server.rtt_ms or 0
         tx_id = id(req.tx)
 
+        seq = req.seq
+
         def expire() -> None:
             # Not re-requested before the server's own timeout (09 section 7.5).
+            r.server.pending.pop(seq, None)
             if self._requests.get(tx_id) is req and req.current is r:
                 self._requests.pop(tx_id, None)
 
@@ -958,6 +989,7 @@ class Federation:
             return
         r = req.current
         req.result = name
+        s.pending.pop(req.seq, None)
         if req.soft_timer is not None:
             req.soft_timer.cancel()
         _LOGGER.debug(
@@ -978,10 +1010,13 @@ class Federation:
 
     # ------------------------------------------------------------------ owner: records
 
+    def _record(self, path: str) -> PublisherRecord:
+        record = self.records.setdefault(path, PublisherRecord())
+        record.prune(self.server.unix())
+        return record
+
     def _failure(self, path: str, weight: float) -> None:
-        self.records.setdefault(path, PublisherRecord()).failures.append(
-            (float(self.server.unix()), weight)
-        )
+        self._record(path).failures.append((float(self.server.unix()), weight))
         self._store.async_delay_save(self._store_data, RECORD_SAVE_DELAY_S)
 
     def _answered(self, tx: Transmission, path: str | None, carries: bool, sent: bool) -> None:
@@ -992,13 +1027,13 @@ class Federation:
         if ex is not None and ex.reply_to == fcnt:
             # Phantom retries: a retransmission the original's publisher did not
             # report is ignored for credit and failure (09 section 9).
-            if tx.receptions or ex.reporters & reporters:
+            if tx.receptions or ex.path in reporters:
                 ex.answers += 1
             return
         if path is None or not carries:
             self._exchanges.pop(eui, None)
             return
-        self._exchanges[eui] = Exchange(fcnt, path, reporters, sent=sent)
+        self._exchanges[eui] = Exchange(fcnt, path, sent=sent)
 
     @callback
     def answered_locally(self, tx: Transmission) -> None:
@@ -1016,9 +1051,7 @@ class Federation:
         if ex.answers != 1 or not ex.sent:
             return
         if dl_ack:
-            self.records.setdefault(ex.path, PublisherRecord()).credits.append(
-                float(self.server.unix())
-            )
+            self._record(ex.path).credits.append(float(self.server.unix()))
             self._store.async_delay_save(self._store_data, RECORD_SAVE_DELAY_S)
         elif fcnt == ex.reply_to + 1:
             self._failure(ex.path, 1.0)
@@ -1077,7 +1110,8 @@ class Federation:
             for r in heard:
                 rx_ref = secrets.token_bytes(8)  # fresh per reception and server (6.2)
                 dl = self.downlinks and txn.ftype in CONFIRMED and self._candidate(r)
-                s.issued[rx_ref] = Issued(r, txn, dl, now)
+                # Remembered 5 s from the reception (09 section 6.2).
+                s.issued[rx_ref] = Issued(r, txn, dl, r.at_ms)
                 flags = (csf.RXF_TS_UNCERTAIN if r.flags & cs.UPF_TS_UNCERTAIN else 0) | (
                     csf.RXF_DOWNLINK if dl else 0
                 )
@@ -1155,6 +1189,8 @@ class Federation:
         self._fed_airtime.setdefault(iss.heard.proxy.subentry_id, []).append((now, airtime))
         amount, at = s.quota.get(requester, (0.0, now))
         s.quota[requester] = (amount * 0.5 ** ((now - at) / QUOTA_HALF_LIFE_MS) + airtime, now)
+        # Requesters quiet for a day have decayed to nothing.
+        s.quota = {r: v for r, v in s.quota.items() if now - v[1] < 24 * HOUR_MS}
         # Exactly one result per forward (09 section 7.5), even if the proxy never
         # reports: by then the server's forward timeout has passed anyway.
         self._later(TX_RESULT_WAIT_S, lambda: on_result("radio_error", 0))
