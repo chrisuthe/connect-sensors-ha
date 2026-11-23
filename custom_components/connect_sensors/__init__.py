@@ -8,7 +8,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    issue_registry as ir,
+)
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
@@ -57,9 +61,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEntr
             translation_placeholders={"port": str(server.port), "error": str(err)},
         ) from err
     entry.runtime_data = server
+    _remove_old_mailboxes(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
+
+
+def _remove_old_mailboxes(hass: HomeAssistant, entry: ConnectSensorsConfigEntry) -> None:
+    """Drop the devices of mailbox servers no longer in use."""
+    federation = entry.runtime_data.federation
+    keep = {f"mailbox_{s.key}" for s in federation.servers.values()} if federation else set()
+    registry = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(registry, entry.entry_id):
+        ids = {i for d, i in device.identifiers if d == DOMAIN}
+        if any(i.startswith("mailbox_") for i in ids) and not ids & keep:
+            registry.async_update_device(device.id, remove_config_entry_id=entry.entry_id)
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConnectSensorsConfigEntry) -> None:

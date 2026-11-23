@@ -191,6 +191,14 @@
       },
       "uplink_counter": {
         "name": "Uplink counter"
+      },
+      "federated_paths": {
+        "name": "Federated paths",
+        "state_attributes": {
+          "paths": {
+            "name": "Paths"
+          }
+        }
       }
     }
   },
@@ -262,6 +270,18 @@
     "single_path": {
       "description": "For more than a day, only {proxy} has heard {name}. If that proxy goes offline, Home Assistant loses the device.\n\nAdd a proxy within range of {name} to give it a second path. This issue clears once another proxy hears it.",
       "title": "Only one proxy hears {name}"
+    },
+    "mailbox_unreachable": {
+      "title": "Mailbox server {url} is unreachable",
+      "description": "Home Assistant has not been connected to the mailbox server {url} for over an hour. The last error was: {error}.\n\nWhile it is unreachable, devices heard only through neighbours are not received, and neighbours cannot use your proxies through it. Check the address in the federation options, and that the server is running. This issue clears when Home Assistant connects again."
+    },
+    "mailbox_refused": {
+      "title": "Mailbox server {url} refused this home",
+      "description": "The mailbox server {url} refused Home Assistant ({code}). With NOT_PERMITTED, the server only admits its members: ask its operator to admit this home, or remove the server in the federation options. With BAD_PROOF, the server rejected the proofs for your devices' tags, which should not happen with a correct server.\n\nThis issue clears when the server accepts the home again."
+    },
+    "single_path_federated": {
+      "title": "{name} is heard only through neighbours",
+      "description": "For more than a day, {name} has reached Home Assistant only through neighbours' proxies. If they go offline, or stop sharing their coverage, Home Assistant loses the device.\n\nAdd a proxy of your own within range of {name}. This issue clears once two of your own proxies hear it."
     }
   },
   "selector": {
@@ -330,6 +350,37 @@
         }
       },
       "name": "Set value"
+    }
+  },
+  "options": {
+    "error": {
+      "invalid_url": "Each mailbox server needs a secure WebSocket address, starting with wss://.",
+      "no_servers": "Add at least one mailbox server to use federation.",
+      "invalid_certificate": "This is not a PEM certificate. Paste the server's certificate, from -----BEGIN CERTIFICATE----- to -----END CERTIFICATE-----."
+    },
+    "step": {
+      "init": {
+        "title": "Federation",
+        "description": "Federation lets homes help each other through mailbox servers. Your sensors can reach Home Assistant through a neighbour's proxies, and your proxies can carry a neighbour's sensors. Readings stay encrypted: neither the mailbox server nor the neighbour can read them.\n\nPairing is never federated. A new device is always paired near one of your own proxies; afterwards it can be moved anywhere a neighbour's proxy hears it.\n\nEverything here is off until you turn it on.",
+        "data": {
+          "mailbox_servers": "Mailbox servers",
+          "federation_owner": "Receive my sensors through neighbours",
+          "federation_publish": "Share my coverage with neighbours",
+          "federation_downlinks": "Let neighbours' sensors use my proxies to receive replies",
+          "ignore_federated_events": "Ignore events heard only through neighbours",
+          "ignore_federated_readings": "Ignore readings heard only through neighbours",
+          "mailbox_certificate": "Trusted certificate"
+        },
+        "data_description": {
+          "mailbox_servers": "The wss:// address of each mailbox server to use. Home Assistant keeps a separate key for each one.",
+          "federation_owner": "Your sensors' frames heard by neighbours' proxies are delivered to you, and Home Assistant can answer them through those proxies. A device heard only this way gets queued commands with its next confirmed uplink, which can take up to its heartbeat interval.",
+          "federation_publish": "Frames your proxies hear that belong to none of your devices are passed to the mailbox servers, which deliver them only to their owners. Pairing requests are never passed on.",
+          "federation_downlinks": "Neighbours can ask your proxies to transmit the replies to their sensors' frames that your proxies heard. Your own devices come first, and neighbours get at most 0.5% of each proxy's airtime.",
+          "ignore_federated_events": "A neighbour's proxy or a mailbox server that is a device's only path controls when its frames arrive. Turn this on to fire no events, such as button presses, from frames that came only through federation.",
+          "ignore_federated_readings": "The same for readings: keep the last value instead of one that came only through federation.",
+          "mailbox_certificate": "Only for a mailbox server with a self-signed certificate: paste its certificate (PEM) to trust it, in addition to the usual certificate authorities."
+        }
+      }
     }
   }
 }

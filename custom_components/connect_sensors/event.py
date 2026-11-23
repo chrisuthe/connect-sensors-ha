@@ -8,7 +8,12 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ConnectSensorsConfigEntry
-from .const import BUTTON_EVENTS, SIGNAL_DEVICE_ADDED, SIGNAL_NEW_READING, signal_device_event
+from .const import (
+    BUTTON_EVENTS,
+    signal_device_added,
+    signal_device_event,
+    signal_new_reading,
+)
 from .entity import ReadingEntity
 from .readings import EVENT_KINDS, split_reading_key
 from .server import Device
@@ -42,8 +47,12 @@ async def async_setup_entry(
 
     for device in server.devices.values():
         add_device(device)
-    entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_DEVICE_ADDED, add_device))
-    entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_NEW_READING, add_reading))
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, signal_device_added(entry.entry_id), add_device)
+    )
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, signal_new_reading(entry.entry_id), add_reading)
+    )
 
 
 class ReadingEvent(ReadingEntity, EventEntity):

@@ -10,8 +10,9 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ConnectSensorsConfigEntry
-from .const import SIGNAL_DEVICE_ADDED, SIGNAL_NEW_READING, SIGNAL_PROXY_BOUND
-from .entity import DeviceEntity, ProxyEntity, ReadingEntity
+from .const import signal_device_added, signal_new_reading, signal_proxy_bound
+from .entity import DeviceEntity, MailboxEntity, ProxyEntity, ReadingEntity
+from .federation import MailboxServer
 from .readings import BINARY_KINDS, BINARY_UNKNOWN, split_reading_key
 from .server import Device, Proxy
 
@@ -49,14 +50,24 @@ async def async_setup_entry(
     def add_proxy(proxy: Proxy) -> None:
         async_add_entities([ProxyConnected(proxy)], config_subentry_id=proxy.subentry_id)
 
+    if server.federation is not None:
+        async_add_entities(
+            MailboxConnected(entry.entry_id, s) for s in server.federation.servers.values()
+        )
     for device in server.devices.values():
         add_device(device)
     for proxy in server.proxies.values():
         if proxy.proxy_id is not None:
             add_proxy(proxy)
-    entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_DEVICE_ADDED, add_device))
-    entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_NEW_READING, add_reading))
-    entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_PROXY_BOUND, add_proxy))
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, signal_device_added(entry.entry_id), add_device)
+    )
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, signal_new_reading(entry.entry_id), add_reading)
+    )
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, signal_proxy_bound(entry.entry_id), add_proxy)
+    )
 
 
 class ReadingBinarySensor(ReadingEntity, BinarySensorEntity):
@@ -112,3 +123,23 @@ class ProxyConnected(ProxyEntity, BinarySensorEntity):
     def is_on(self) -> bool:
         """Connected."""
         return self.proxy.connected
+
+
+class MailboxConnected(MailboxEntity, BinarySensorEntity):
+    """Connected and authenticated to a mailbox server (09 section 12.3)."""
+
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, entry_id: str, server: MailboxServer) -> None:
+        super().__init__(entry_id, server, "connected")
+
+    @property
+    def is_on(self) -> bool:
+        """Connected."""
+        return self.mailbox.up
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | int | None]:
+        """Round-trip time and why the last attempt failed."""
+        return {"rtt_ms": self.mailbox.rtt_ms, "last_error": self.mailbox.last_error}

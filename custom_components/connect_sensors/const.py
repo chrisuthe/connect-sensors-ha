@@ -12,6 +12,16 @@ CONF_PROFILE: Final = "profile"
 CONF_PAIRING_CODE: Final = "pairing_code"
 CONF_HEARTBEAT: Final = "heartbeat_minutes"
 
+# Federation options (spec 09), each off by default.
+CONF_MAILBOX_SERVERS: Final = "mailbox_servers"
+CONF_MAILBOX_CERTIFICATE: Final = "mailbox_certificate"
+CONF_FEDERATION_OWNER: Final = "federation_owner"
+CONF_FEDERATION_PUBLISH: Final = "federation_publish"
+CONF_FEDERATION_DOWNLINKS: Final = "federation_downlinks"
+# Spec 07 section 4.4: ignore events, and separately readings, of federation-only frames.
+CONF_IGNORE_FEDERATED_EVENTS: Final = "ignore_federated_events"
+CONF_IGNORE_FEDERATED_READINGS: Final = "ignore_federated_readings"
+
 SUBENTRY_PROXY: Final = "proxy"
 SUBENTRY_DEVICE: Final = "device"
 
@@ -78,6 +88,17 @@ UNREACHABLE_GRACE_MIN: Final = 5
 SINGLE_PATH_WINDOW_H: Final = 24
 SINGLE_PATH_REPAIR_H: Final = 24
 
+# Spec 09 section 6.1: publishes per second per mailbox server.
+PUBLISH_PER_SECOND: Final = 5
+# Spec 09 section 7.4 and 11 (mode 4): federated airtime per proxy, 0.5% of a rolling
+# hour, and federated downlinks per minute in total.
+FED_BUDGET_MS_PER_HOUR: Final = 18_000
+FED_DOWNLINKS_PER_MINUTE: Final = 10
+# Spec 07 section 4.4: federated SYNC frames per minute, across all mailbox servers.
+FED_BOOTSTRAP_PER_MINUTE: Final = 50
+# A mailbox server unreachable this long gets a repair issue.
+MAILBOX_UNREACHABLE_REPAIR_H: Final = 1
+
 TX_RESULTS: Final = {
     0: "sent",
     1: "too_late",
@@ -88,9 +109,6 @@ TX_RESULTS: Final = {
     6: "radio_error",
 }
 
-SIGNAL_DEVICE_ADDED: Final = f"{DOMAIN}_device_added"
-SIGNAL_PROXY_BOUND: Final = f"{DOMAIN}_proxy_bound"
-SIGNAL_NEW_READING: Final = f"{DOMAIN}_new_reading"
 
 # Spec 07 section 11.3: bus events.
 EVENT_DEVICE_UNREACHABLE: Final = f"{DOMAIN}_device_unreachable"
@@ -130,3 +148,23 @@ def signal_device_event(dev_eui: str) -> str:
 def signal_proxy_update(subentry_id: str) -> str:
     """Dispatcher signal for changes to one proxy."""
     return f"{DOMAIN}_proxy_update_{subentry_id}"
+
+
+def signal_device_added(entry_id: str) -> str:
+    """Dispatcher signal for a device added to a network: (device)."""
+    return f"{DOMAIN}_device_added_{entry_id}"
+
+
+def signal_proxy_bound(entry_id: str) -> str:
+    """Dispatcher signal for a proxy that said its first HELLO: (proxy)."""
+    return f"{DOMAIN}_proxy_bound_{entry_id}"
+
+
+def signal_new_reading(entry_id: str) -> str:
+    """Dispatcher signal for a reading key first heard: (device, key)."""
+    return f"{DOMAIN}_new_reading_{entry_id}"
+
+
+def signal_mailbox_update(entry_id: str) -> str:
+    """Dispatcher signal for changes to a network's mailbox connections."""
+    return f"{DOMAIN}_mailbox_update_{entry_id}"

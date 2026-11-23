@@ -58,6 +58,7 @@ async def test_button_events(
             "channel": 1,
             "kind": "button",
             "event_type": event_type,
+            "federation_only": False,
         }
         for event_type in ("press", "long_press")
     ]
