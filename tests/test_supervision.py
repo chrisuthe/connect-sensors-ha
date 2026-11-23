@@ -40,7 +40,7 @@ async def heartbeat(
     """A confirmed heartbeat at the current time, answered in RX1."""
     proxy.hello()  # time has passed: it would be offline otherwise
     await proxy.recv(cs.M_SERVER_STATUS)
-    sensor.server_time = int(time.time())
+    sensor.set_clock(int(time.time()))
     rx = proxy.uplink(
         sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0) if readings is None else readings)
     )
@@ -184,7 +184,7 @@ async def test_single_path(
         await second.connect()
         proxy.hello()
         await proxy.recv(cs.M_SERVER_STATUS)
-        sensor.server_time = int(time.time())
+        sensor.set_clock(int(time.time()))
         frame = sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0))
         rx = proxy.uplink(frame, snr=9.0)
         second.uplink(frame, snr=1.0)

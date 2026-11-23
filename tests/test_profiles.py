@@ -12,7 +12,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.connect_sensors.const import (
     CONF_DEV_EUI,
-    CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
     CONF_PROFILE,
@@ -24,7 +23,7 @@ from custom_components.connect_sensors.const import (
 from custom_components.connect_sensors.profiles import get_profile
 
 from .common import pair, parse_commands, uplink_answered
-from .conftest import DEV_EUI, K_NET, K_ROOT, PROXY_ID, PROXY_KEY, WallClock, state_of
+from .conftest import DEV_EUI, K_ROOT, PROXY_ID, PROXY_KEY, WallClock, state_of
 from .sim import SimProxy, SimSensor
 
 UNKNOWN_PROFILE = "ACME.THING-7"
@@ -49,8 +48,9 @@ def entry_with_profile(port: int, profile: str) -> MockConfigEntry:
     """A network with one proxy and one device of the given profile."""
     return MockConfigEntry(
         domain=DOMAIN,
+        version=2,
         title="ConnectSensors",
-        data={CONF_REGION: "US915", CONF_PORT: port, CONF_K_NET: K_NET},
+        data={CONF_REGION: "US915", CONF_PORT: port},
         subentries_data=[
             {
                 "data": {CONF_KEY: PROXY_KEY},

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
@@ -11,8 +13,10 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
-from .server import STATE_STORAGE_KEY, STORAGE_VERSION, NetworkServer
+from .server import STATE_STORAGE_KEY, STATE_STORAGE_VERSION, NetworkServer
 from .services import async_setup_services
+
+_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.EVENT, Platform.SENSOR]
 
@@ -24,6 +28,18 @@ type ConnectSensorsConfigEntry = ConfigEntry[NetworkServer]
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register the actions, which work while a network is loaded."""
     async_setup_services(hass)
+    return True
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEntry) -> bool:
+    """Version 2 (connectsensors 0.4.0) has no network key (02 section 5.2). The
+    device records are migrated with the server's state store."""
+    if entry.version > 2:
+        return False
+    if entry.version == 1:
+        data = {k: v for k, v in entry.data.items() if k != "k_net"}
+        hass.config_entries.async_update_entry(entry, data=data, version=2)
+        _LOGGER.info("Migrated the network to version 2: the network key is gone")
     return True
 
 
@@ -70,4 +86,4 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEnt
     for domain, issue_id in list(registry.issues):
         if domain == DOMAIN:
             ir.async_delete_issue(hass, DOMAIN, issue_id)
-    await Store[dict[str, object]](hass, STORAGE_VERSION, STATE_STORAGE_KEY).async_remove()
+    await Store[dict[str, object]](hass, STATE_STORAGE_VERSION, STATE_STORAGE_KEY).async_remove()

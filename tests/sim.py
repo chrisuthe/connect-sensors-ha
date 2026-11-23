@@ -132,14 +132,17 @@ class SimProxy(asyncio.DatagramProtocol):
 
 
 class SimSensor:
-    """A sensor: pairs with SensorPairing, then sends frames under its session keys."""
+    """A sensor: pairs with SensorPairing, then sends frames under its session keys.
+
+    Its clock is real time plus clock_offset, which each downlink's server_time sets.
+    """
 
     def __init__(self, k_root: bytes, dev_eui: bytes) -> None:
         self.dev_eui = dev_eui
+        self.root = cs.keys_from(k_root, dev_eui)
         self.pairing = cs.SensorPairing(k_root, dev_eui)
         self.fcnt = 200
-        self.k_net_route: bytes | None = None
-        self.server_time = 0
+        self.clock_offset = 0
         self.session_floor = 0
         self._priv = 0xA1
 
@@ -154,6 +157,20 @@ class SimSensor:
         """Session key set."""
         return cs.keys_from(self.k_session, self.dev_eui)
 
+    def now(self) -> int:
+        """The sensor's clock."""
+        return int(time.time()) + self.clock_offset
+
+    def set_clock(self, server_time: int) -> None:
+        """Take a downlink's server_time."""
+        self.clock_offset = server_time - int(time.time())
+
+    def restore(self, k_session: bytes, fcnt: int) -> None:
+        """A sensor paired under k_session that last sent fcnt."""
+        self.pairing.k_session = k_session
+        self.pairing.state = "PAIRED"
+        self.fcnt = fcnt
+
     def join(self) -> bytes:
         """A JOIN with a fresh ephemeral key (02 section 11.1)."""
         self.fcnt += 1
@@ -161,45 +178,41 @@ class SimSensor:
         return self.pairing.join(self.fcnt, bytes([self._priv]) * 32)
 
     def key_exchange(self, frame: bytes) -> str:
-        """Take the server's answer to JOIN; a new k_session resets the session floor."""
+        """Take the server's answer to JOIN: SESSION, with the clock it sets."""
         result = self.pairing.downlink(frame)
         if result == "accept":
             self.session_floor = 0
+            _, pt = cs.open_frame(self.root, frame)
+            self.set_clock(struct.unpack(">I", pt[4:8])[0])
         return result
 
-    def sync(self) -> bytes:
-        """A SYNC acknowledging KEY_EXCHANGE (04 section 4.4, step 5)."""
-        self.fcnt += 1
-        return cs.seal(
-            self.session, cs.T_SYNC, cs.ZERO_TAG, cs.ZERO_TAG, self.fcnt, bytes([cs.UF_DL_ACK])
-        )
-
     def uplink(self, ftype: int, readings: bytes, uflags: int = 0) -> bytes:
-        """A frame with normal tags (02 section 6)."""
-        assert self.k_net_route is not None
+        """A session frame: normal tag, or the bootstrap tag for SYNC (02 section 6.1)."""
         self.fcnt += 1
-        epoch = cs.epoch_of(self.server_time)
-        return cs.seal(
-            self.session,
-            ftype,
-            cs.net_tag(self.k_net_route, epoch),
-            cs.dev_tag(self.session.k_dev_tag, epoch),
-            self.fcnt,
-            bytes([uflags]) + readings,
-        )
+        return self.pairing.uplink(ftype, self.fcnt, self.now(), bytes([uflags]) + readings)
+
+    def sync(self, readings: bytes = b"", uflags: int = 0) -> bytes:
+        """A SYNC: clock unknown, or lost contact (02 section 11.2)."""
+        return self.uplink(cs.T_SYNC, readings, uflags | cs.UF_TIME_UNSURE)
 
     def downlink(self, frame: bytes) -> dict[str, Any]:
-        """Accept a session downlink as a sensor does (02 section 10.2)."""
+        """Accept a session downlink as a sensor does (02 section 10.2). The first one,
+        in the provisional SESSION state, makes the sensor PAIRED (04 section 4.3)."""
+        if self.pairing.state == "SESSION":
+            assert self.pairing.downlink(frame) == "accept"
         h, pt = cs.open_frame(self.session, frame)
         assert h.ftype == cs.T_DOWNLINK
         assert h.fcnt > self.session_floor, "downlink counter not above the floor"
         self.session_floor = h.fcnt
         reply_to, server_time, flags = struct.unpack(">IIB", pt[:9])
-        commands = pt[9:]
-        self.server_time = server_time
-        if commands and commands[0] == cs.CMD_SET_NETWORK:
-            self.k_net_route = commands[2 : 2 + commands[1]]
-        return {"fcnt": h.fcnt, "reply_to": reply_to, "flags": flags, "commands": commands}
+        self.set_clock(server_time)
+        return {
+            "fcnt": h.fcnt,
+            "tag": h.tag,
+            "reply_to": reply_to,
+            "flags": flags,
+            "commands": pt[9:],
+        }
 
 
 def downlink_body(m: dict[str, Any]) -> dict[str, Any]:

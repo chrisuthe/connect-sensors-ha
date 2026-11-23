@@ -5,7 +5,6 @@ from typing import Final
 DOMAIN: Final = "connect_sensors"
 
 CONF_REGION: Final = "region"
-CONF_K_NET: Final = "k_net"
 CONF_KEY: Final = "key"
 CONF_DEV_EUI: Final = "dev_eui"
 CONF_K_ROOT: Final = "k_root"
@@ -30,6 +29,9 @@ REGIONS: Final[dict[str, tuple[int | None, int, int]]] = {
 STATE_SCANNED: Final = "scanned"
 STATE_EXCHANGED: Final = "exchanged"
 STATE_PAIRED: Final = "paired"
+# Spec 04 section 4.2: EXCHANGED falls back to SCANNED when no uplink under the pending
+# k_session verifies within 2 minutes.
+EXCHANGED_TIMEOUT_S: Final = 120
 
 # Spec 07 section 4.1 and 4.2.
 COLLECTION_WINDOW_MS: Final = 150

@@ -26,7 +26,6 @@ from custom_components.connect_sensors.const import DOMAIN
 from .common import answer, full_state, pair
 from .conftest import (
     DEV_EUI,
-    K_NET,
     K_ROOT,
     PROXY_ID,
     Clock,
@@ -46,9 +45,10 @@ async def test_proxy_session(
 ) -> None:
     """HELLO_REQUEST handshake, SERVER_STATUS, the proxy's device and entities."""
     status = await proxy.connect()
-    tags = cs.parse_server_status(bytes.fromhex(status["body"]))["tags"]
-    route = cs.derive_net_route(bytes.fromhex(K_NET))
-    assert cs.net_tag(route, cs.epoch_of(int(time.time()))) in tags
+    # server_time and hello_seq only: proxies hold no tags (05 section 5.3).
+    body = bytes.fromhex(status["body"])
+    assert len(body) == 8
+    assert abs(cs.parse_server_status(body)["server_time"] - time.time()) < 5
     await hass.async_block_till_done()
 
     device = dr.async_get(hass).async_get_device_by_identifier(
@@ -129,10 +129,15 @@ async def test_pairing_contact_and_acks(
     assert root_header.fcnt == 1  # the first root downlink counter value
 
     assert sensor.key_exchange(key_exchange) == "accept"
-    rx = proxy.uplink(sensor.sync())
-    assert sensor.downlink(await answer(proxy, rx))["commands"][0] == cs.CMD_SET_NETWORK
-    rx = proxy.uplink(sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0), cs.UF_DL_ACK))
-    sensor.downlink(await answer(proxy, rx))
+    assert sensor.pairing.state == "SESSION"
+    # The first session uplink, found by its normal tag, makes the device PAIRED, and
+    # its answer, under the session keys with the uplink's tag, the sensor too.
+    first = sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0), cs.UF_DL_ACK)
+    rx = proxy.uplink(first)
+    paired = sensor.downlink(await answer(proxy, rx))
+    assert paired["tag"] == cs.parse_header(first).tag  # type: ignore[union-attr]
+    assert paired["commands"] == b""
+    assert sensor.pairing.state == "PAIRED"
     await hass.async_block_till_done()
 
     assert state_of(hass, PAIRING).state == "paired"
@@ -242,8 +247,6 @@ async def test_new_join_while_exchanged(
     await hass.async_block_till_done()
     assert state_of(hass, PAIRING).state == "exchanged"
 
-    rx = proxy.uplink(sensor.sync())
-    assert sensor.downlink(await answer(proxy, rx))["commands"][0] == cs.CMD_SET_NETWORK
     rx = proxy.uplink(sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(0), cs.UF_DL_ACK))
     sensor.downlink(await answer(proxy, rx))
     await hass.async_block_till_done()
@@ -393,7 +396,7 @@ async def test_diagnostics_redacted(
     assert device["state"] == "paired"
     assert device["k_session"] == "**REDACTED**"
     assert diag["server"]["proxies"]["proxy1"]["proxy_id"] == PROXY_ID.hex()
-    assert diag["entry"]["data"]["k_net"] == "**REDACTED**"
+    assert "k_net" not in diag["entry"]["data"]
 
 
 async def test_start_from_storage(
@@ -421,7 +424,7 @@ async def test_start_from_storage(
         "snr": None,
     }
     hass_storage["connect_sensors.state"] = {
-        "version": 1,
+        "version": 2,
         "minor_version": 1,
         "key": "connect_sensors.state",
         "data": {"proxies": {}, "devices": {DEV_EUI: record}},
@@ -431,13 +434,10 @@ async def test_start_from_storage(
     await hass.async_block_till_done()
     assert state_of(hass, DOOR).state == STATE_ON
 
-    sensor.pairing.k_session = k_session
-    sensor.k_net_route = cs.derive_net_route(bytes.fromhex(K_NET))
-    sensor.server_time = int(time.time())
     await proxy.connect()
 
     # The last accepted counter is not accepted again.
-    sensor.fcnt = last_fcnt - 1
+    sensor.restore(k_session, last_fcnt - 1)
     proxy.uplink(sensor.uplink(cs.T_DATA_CONFIRMED, cs.encode_reading(0, 0x01, 0)))
     await proxy.nothing()
     assert state_of(hass, DOOR).state == STATE_ON

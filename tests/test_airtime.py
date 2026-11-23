@@ -13,7 +13,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.connect_sensors import server
 from custom_components.connect_sensors.const import (
     CONF_DEV_EUI,
-    CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
     CONF_PROFILE,
@@ -25,7 +24,7 @@ from custom_components.connect_sensors.const import (
 )
 
 from .common import answer, full_state, pair
-from .conftest import DEV_EUI, K_NET, K_ROOT, PROXY_KEY
+from .conftest import DEV_EUI, K_ROOT, PROXY_KEY
 from .sim import SimProxy, SimSensor
 
 
@@ -41,8 +40,9 @@ def entry(port: int, region: str) -> MockConfigEntry:
     """The network in this region, with one proxy and one device."""
     return MockConfigEntry(
         domain=DOMAIN,
+        version=2,
         title="ConnectSensors",
-        data={CONF_REGION: region, CONF_PORT: port, CONF_K_NET: K_NET},
+        data={CONF_REGION: region, CONF_PORT: port},
         subentries_data=[
             {
                 "data": {CONF_KEY: PROXY_KEY},

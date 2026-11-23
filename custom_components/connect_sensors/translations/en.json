@@ -20,7 +20,7 @@
         },
         "data_description": {
           "port": "UDP port the proxies send to.",
-          "region": "The radio profile of your sensors and proxies. A network key is generated for you."
+          "region": "The radio profile of your sensors and proxies."
         },
         "description": "Set up the ConnectSensors network. Add proxies and devices to it afterwards."
       }
@@ -226,6 +226,24 @@
     "proxy_mismatch": {
       "description": "{name} uses {proxy_settings}, but the network uses {network_settings}. Home Assistant sends no downlinks through it, so devices only it hears cannot pair or get their acknowledgements.\n\nSet `region: {region}` in the proxy's ESPHome configuration and install it again. This issue clears when the proxy reports matching settings.",
       "title": "Proxy {name} uses other radio settings"
+    },
+    "re_pair": {
+      "title": "Re-pair {name}: press its button near one of your proxies",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Re-pair {name}",
+            "description": "This version of the integration uses new frame tags and a new pairing procedure. {name} lost its pairing when its firmware was updated for them, so Home Assistant no longer hears it, and its readings show as unavailable.\n\nPress the device's button once, near one of your proxies. When the device's *Pairing* sensor shows *Paired*, submit this form.\n\nIf pairing does not finish, hold the button for 10 seconds to factory-reset the device, then press it again."
+          }
+        },
+        "error": {
+          "not_paired": "{name} is not paired yet. Press its button near one of your proxies, wait a few seconds, and submit again."
+        },
+        "abort": {
+          "device_removed": "The device was removed.",
+          "not_loaded": "The ConnectSensors network is not loaded."
+        }
+      }
     },
     "shared_key": {
       "fix_flow": {

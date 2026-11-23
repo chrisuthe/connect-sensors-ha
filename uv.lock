@@ -866,7 +866,7 @@ dev = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "connectsensors", specifier = "==0.3.0" },
+    { name = "connectsensors", specifier = "==0.4.0" },
     { name = "mypy", specifier = "==2.4.1" },
     { name = "pytest-homeassistant-custom-component", specifier = "==0.13.375" },
     { name = "ruff", specifier = "==0.17.6" },
@@ -874,14 +874,14 @@ dev = [
 
 [[package]]
 name = "connectsensors"
-version = "0.3.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/09/3c/0f3e240017dc3fb47e972d8e7c2012541016ba5ce7399ca67bd17d3c8cf9/connectsensors-0.3.0.tar.gz", hash = "sha256:6db23b59ef454ec6cc999b4018ceee1ab3a2db4a8532d035c014012cf30bd166", size = 27157, upload-time = "2026-11-22T23:04:58.827Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ae/e2/0bfbfa714a6f6368078448b60b1adb655127f965cd8640b3116c9437afd1/connectsensors-0.4.0.tar.gz", hash = "sha256:fa16ab04cf2fa36b34499c078560939a2f19c481ab96e526fb5f3de0a55079c4", size = 41369, upload-time = "2026-11-23T13:09:40.408Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f4/41/4f88dd5512832af546741b322020d6be8640a93b716752af6a0a9425e562/connectsensors-0.3.0-py3-none-any.whl", hash = "sha256:060552a7edd484af4a9afb8f61d28ab7b35bdff23a8248442cbb8a94ea4ceca7", size = 28668, upload-time = "2026-11-22T23:04:57.503Z" },
+    { url = "https://files.pythonhosted.org/packages/30/1a/6dd95f4e589c4c5ccd0da3a3e03d5e229c44667c3aed45ea64ce93bb7ebd/connectsensors-0.4.0-py3-none-any.whl", hash = "sha256:d16a40c3e6064e6cbb40744bf2a8d899677d95397d8ee0b627d26f902d350399", size = 42768, upload-time = "2026-11-23T13:09:39.266Z" },
 ]
 
 [[package]]

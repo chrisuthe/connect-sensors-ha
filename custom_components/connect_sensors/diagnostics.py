@@ -8,10 +8,9 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
 from . import ConnectSensorsConfigEntry
-from .const import CONF_K_NET, CONF_K_ROOT, CONF_KEY
+from .const import CONF_K_ROOT, CONF_KEY
 
 TO_REDACT = {
-    CONF_K_NET,
     CONF_K_ROOT,
     CONF_KEY,
     "k_session",

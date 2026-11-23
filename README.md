@@ -26,8 +26,7 @@ Without HACS, copy `custom_components/connect_sensors` into your configuration's
 ## Set up
 
 1. **Network.** Adding the integration creates the network: choose the region profile
-   (`US915`; `EU868` is provisional) and the UDP port (default 47800). A network key
-   is generated and stays in Home Assistant.
+   (`US915`; `EU868` is provisional) and the UDP port (default 47800).
 2. **Proxies.** On the integration's page, **Add proxy**. Paste the `cs_proxy:` snippet
    it shows (with the generated key and Home Assistant's address) into the proxy's
    ESPHome configuration and install it. The proxy appears as a device when its first
@@ -70,7 +69,7 @@ a repair issue suggests adding a proxy within range.
 - UDP proxy sessions (`HELLO_REQUEST`, nonce echo, `SERVER_STATUS`), per-proxy keys.
 - Uplink collection and dedupe, tag lookup and trial decryption, counter checks.
 - Acks for confirmed uplinks in RX1 through the proxy with the best SNR that heard them.
-- Pairing: `JOIN` → `KEY_EXCHANGE` → `SYNC` → `SET_NETWORK` → paired, with a root
+- Pairing: `JOIN` → `KEY_EXCHANGE` → the first session uplink → paired, with a root
   downlink counter that is never reset (kept even after the device is removed).
 - Entities: contact, motion, leak and other binary readings; temperature, humidity,
   battery and other numeric readings; diagnostics for pairing state, last seen, RSSI,
@@ -121,7 +120,25 @@ a repair issue suggests adding a proxy within range.
   downlinks, and one that would accept them raises a repair issue that gives it a new
   key.
 
-Not yet: mDNS, federation, key rotation, profile distribution (spec 10).
+## What connectsensors 0.4.0 changes
+
+- Frames carry one 8-byte tag, a key fingerprint derived from the device's own keys
+  (02 section 6). There is no network key and no `SET_NETWORK`. Home Assistant keeps a
+  tag table: each device's normal tags for the previous, current and next hour, and its
+  `SYNC` tags for the counter blocks around the last frame it sent (07 section 3). The
+  table moves on at each hour.
+- `JOIN`, and a `SYNC` far past the last counter seen, are found by trial decryption,
+  at most 50 a minute (02 section 11.3).
+- Pairing ends on the first session uplink: it marks the device paired, and its answer
+  completes pairing on the sensor (04 section 4). If no such uplink arrives within 2
+  minutes of `KEY_EXCHANGE`, the device waits for the button again.
+- `SERVER_STATUS` carries no tags (05 section 5.3).
+- **Upgrading:** sensors on the 0.4.0 firmware come back unpaired. Each device that
+  was paired shows *Waiting for button press*, its readings show as unavailable, and a
+  repair issue asks you to press its button near one of your proxies. No pairing code
+  or factory reset is needed.
+
+Not yet: mDNS, federation, profile distribution (spec 10).
 
 ## Development
 
