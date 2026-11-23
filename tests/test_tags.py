@@ -148,10 +148,12 @@ async def test_fallback_limit(
     await proxy.connect()
     await pair(hass, proxy, sensor)
     server: NetworkServer = loaded.runtime_data
-    tried = server.trial_decryptions
+    tried, foreign = server.trial_decryptions, server.foreign_frames
 
     with patch("custom_components.connect_sensors.server.BOOTSTRAP_PER_MINUTE", 0):
         sensor.fcnt += 10 * cs.TAG_BLOCK
         proxy.uplink(sensor.sync())
         await proxy.nothing()
     assert server.trial_decryptions == tried
+    # Not tried, so not known to be foreign either.
+    assert server.foreign_frames == foreign

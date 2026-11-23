@@ -871,6 +871,7 @@ class NetworkServer(asyncio.DatagramProtocol):
                 and now - device.exchanged_at >= EXCHANGED_TIMEOUT
             ):
                 self._exchange_timed_out(device)
+                self._save_soon()  # a state change (07 section 10)
                 changed = True
             for sid in [s for s, t in device.heard_by.items() if now - t >= SINGLE_PATH_WINDOW]:
                 del device.heard_by[sid]
@@ -1399,7 +1400,9 @@ class NetworkServer(asyncio.DatagramProtocol):
                 return opened
         # A bootstrap frame that missed the table, or whose candidates all failed the
         # MIC, is tried against every device (02 section 11.3).
-        if cs.is_bootstrap(h.ftype) and route != "drop" and self._bootstrap_allowed(now_ms):
+        if cs.is_bootstrap(h.ftype) and route != "drop":
+            if not self._bootstrap_allowed(now_ms):
+                return None  # dropped unprocessed (07 section 4, step 4)
             for _, device in self._all_devices():
                 if device in tried:
                     continue
@@ -1424,19 +1427,22 @@ class NetworkServer(asyncio.DatagramProtocol):
         return self.devices.get(eui) or self.leaving.get(eui)
 
     @staticmethod
-    def _try(
-        device: Device, frame: bytes, ftype: int
-    ) -> tuple[Device, cs.DeviceKeys, bytes] | None:
-        """Open the frame with the key set its type may use for this device: the root
-        keys for a JOIN while waiting to be paired, else the session keys while
-        EXCHANGED or PAIRED (02 section 11.3)."""
-        keys: cs.DeviceKeys | None = None
+    def _keys(device: Device, ftype: int) -> cs.DeviceKeys | None:
+        """The key set a frame type may use for this device now: the root keys for a
+        JOIN while waiting to be paired, else the session keys while EXCHANGED or
+        PAIRED (02 section 11.3)."""
         if ftype == cs.T_JOIN:
-            if device.state in (STATE_SCANNED, STATE_EXCHANGED):
-                keys = device.root_keys
-        elif device.state in (STATE_EXCHANGED, STATE_PAIRED):
-            keys = device.session_keys
-        if keys is None:
+            return device.root_keys if device.state in (STATE_SCANNED, STATE_EXCHANGED) else None
+        if device.state in (STATE_EXCHANGED, STATE_PAIRED):
+            return device.session_keys
+        return None
+
+    @classmethod
+    def _try(
+        cls, device: Device, frame: bytes, ftype: int
+    ) -> tuple[Device, cs.DeviceKeys, bytes] | None:
+        """Open the frame with the key set its type may use for this device."""
+        if (keys := cls._keys(device, ftype)) is None:
             return None
         try:
             _, plaintext = cs.open_frame(keys, frame)
@@ -1467,6 +1473,11 @@ class NetworkServer(asyncio.DatagramProtocol):
     async def _act(self, tx: Transmission) -> bytes | None:
         """07 section 4, steps 6 and 7. Returns the downlink to send, if any."""
         device, h = tx.device, tx.header
+        if self._keys(device, h.ftype) is not tx.keys:
+            # The keys it verified under were dropped while it waited for the lock:
+            # the exchange timed out or was replaced.
+            _LOGGER.debug("%s: frame %s is under keys no longer in use", device.name, h.fcnt)
+            return None
         fresh = tx.counter in ("accept", "accept_late")
         if fresh:
             best = max(tx.receptions, key=lambda r: r.snr)

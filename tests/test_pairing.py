@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 import connectsensors as cs
 from homeassistant.core import HomeAssistant
+import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.connect_sensors.server import NetworkServer
@@ -80,3 +82,29 @@ async def test_provisional_timeout(
     # Paired devices do not time out.
     await wall.advance(timedelta(minutes=3))
     assert state_of(hass, PAIRING).state == "paired"
+
+
+async def test_timeout_while_uplink_waits(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    wall: WallClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A session uplink identified just before the exchange times out, and acted on
+    after, is dropped: its keys are no longer in use."""
+    await proxy.connect()
+    rx = proxy.uplink(sensor.join())
+    assert sensor.key_exchange(await answer(proxy, rx)) == "accept"
+    server: NetworkServer = loaded.runtime_data
+    device = server.devices[DEV_EUI]
+
+    async with device.lock:
+        proxy.uplink(sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(1), cs.UF_DL_ACK))
+        await asyncio.sleep(0.2)  # identified; its task waits for the lock
+        await wall.advance(timedelta(minutes=2, seconds=5))
+        assert device.state == "scanned"
+    await proxy.nothing()
+    assert device.readings == {}
+    assert "Error processing an uplink" not in caplog.text
