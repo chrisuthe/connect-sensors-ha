@@ -79,9 +79,10 @@ def _remove_old_mailboxes(hass: HomeAssistant, entry: ConnectSensorsConfigEntry)
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConnectSensorsConfigEntry) -> None:
-    """Subentries added or removed are picked up live; a new port needs a reload."""
+    """Subentries added or removed are picked up live; a new port or new federation
+    options need a reload."""
     server = entry.runtime_data
-    if entry.data[CONF_PORT] != server.port:
+    if entry.data[CONF_PORT] != server.port or dict(entry.options) != server.options:
         hass.config_entries.async_schedule_reload(entry.entry_id)
         return
     server.async_sync_subentries()

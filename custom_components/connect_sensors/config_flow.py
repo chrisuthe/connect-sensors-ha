@@ -14,7 +14,7 @@ from homeassistant.config_entries import (
     ConfigFlow,
     ConfigFlowResult,
     ConfigSubentryFlow,
-    OptionsFlowWithReload,
+    OptionsFlow,
     SubentryFlowResult,
 )
 from homeassistant.const import CONF_NAME, CONF_PORT
@@ -190,7 +190,7 @@ def certificate_error(pem: str) -> str | None:
     return None
 
 
-class FederationOptionsFlow(OptionsFlowWithReload):
+class FederationOptionsFlow(OptionsFlow):
     """Mailbox servers and the three federation opt-ins, each off by default (09)."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
