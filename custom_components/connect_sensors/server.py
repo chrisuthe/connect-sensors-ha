@@ -1096,6 +1096,14 @@ class NetworkServer(asyncio.DatagramProtocol):
         ]
         device.next_command_id += 1
         _LOGGER.info("%s: %s queued", device.name, name)
+        if device.proxy_count == 0 and device.federated_count > 0:
+            # 07 section 7: only RX2 answers to confirmed uplinks reach such a device.
+            _LOGGER.info(
+                "%s is heard only through neighbours: %s goes out with its next "
+                "confirmed uplink, within its heartbeat interval",
+                device.name,
+                name,
+            )
         async_dispatcher_send(self.hass, signal_device_update(device.eui))
         await self._async_save()
         return True

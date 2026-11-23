@@ -88,6 +88,7 @@ SOFT_FAILURE_S = 5  # 09 section 9: no result within 5 seconds of the request
 QUOTA_HALF_LIFE_MS = 3_600_000
 RECORD_HALF_LIFE_S = 7 * 86_400
 RECORD_FLOOR = 0.01  # decayed weight below which a credit or failure is forgotten
+RECORD_SAVE_DELAY_S = 60
 HOUR_MS = 3_600_000
 MINUTE_MS = 60_000
 # Plain ws:// is for the reference server's --insecure-dev mode in tests only:
@@ -981,6 +982,7 @@ class Federation:
         self.records.setdefault(path, PublisherRecord()).failures.append(
             (float(self.server.unix()), weight)
         )
+        self._store.async_delay_save(self._store_data, RECORD_SAVE_DELAY_S)
 
     def _answered(self, tx: Transmission, path: str | None, carries: bool, sent: bool) -> None:
         """A downlink answered a transmission, through a publisher or locally."""
@@ -1017,6 +1019,7 @@ class Federation:
             self.records.setdefault(ex.path, PublisherRecord()).credits.append(
                 float(self.server.unix())
             )
+            self._store.async_delay_save(self._store_data, RECORD_SAVE_DELAY_S)
         elif fcnt == ex.reply_to + 1:
             self._failure(ex.path, 1.0)
 
