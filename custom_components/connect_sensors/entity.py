@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
+from homeassistant.helpers.device_registry import (
+    CONNECTION_NETWORK_MAC,
+    DeviceEntryType,
+    DeviceInfo,
+)
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 
-from .const import DOMAIN, signal_device_update, signal_proxy_update
+from .const import DOMAIN, signal_device_update, signal_mailbox_update, signal_proxy_update
+from .federation import MailboxServer
 from .server import Device, Proxy
 
 
@@ -67,6 +72,11 @@ class ReadingEntity(DeviceEntity):
         """Silence is never shown as a value (07 section 8.1)."""
         return self.device.reading_available(self._key)
 
+    @property
+    def extra_state_attributes(self) -> dict[str, bool] | None:
+        """Marks a value that came only through federation (07 section 4.4)."""
+        return {"federation_only": True} if self._key in self.device.fed_only else None
+
 
 class ProxyEntity(Entity):
     """An entity of one proxy, once its proxy_id is known."""
@@ -94,5 +104,37 @@ class ProxyEntity(Entity):
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass, signal_proxy_update(self.proxy.subentry_id), self.async_write_ha_state
+            )
+        )
+
+
+def mailbox_device_id(entry_id: str, server: MailboxServer) -> str:
+    """The device registry identifier of a mailbox server, as one network uses it."""
+    return f"mailbox_{entry_id}_{server.key}"
+
+
+class MailboxEntity(Entity):
+    """An entity of one mailbox server the network uses (spec 09)."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    def __init__(self, entry_id: str, server: MailboxServer, suffix: str) -> None:
+        self.mailbox = server
+        self._entry_id = entry_id
+        device_id = mailbox_device_id(entry_id, server)
+        self._attr_unique_id = f"{device_id}_{suffix}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, device_id)},
+            name=f"Mailbox {server.host}",
+            model="Mailbox server",
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Update on the network's mailbox signal."""
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, signal_mailbox_update(self._entry_id), self.async_write_ha_state
             )
         )

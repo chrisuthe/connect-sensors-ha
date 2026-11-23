@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import logging
@@ -40,6 +40,8 @@ from .const import (
     COMMANDS_MAX_BYTES,
     CONF_DEV_EUI,
     CONF_HEARTBEAT,
+    CONF_IGNORE_FEDERATED_EVENTS,
+    CONF_IGNORE_FEDERATED_READINGS,
     CONF_K_ROOT,
     CONF_KEY,
     CONF_PROFILE,
@@ -60,9 +62,6 @@ from .const import (
     RX1_OFFSET_US,
     RX2_OFFSET_US,
     SAVE_DELAY_S,
-    SIGNAL_DEVICE_ADDED,
-    SIGNAL_NEW_READING,
-    SIGNAL_PROXY_BOUND,
     SINGLE_PATH_REPAIR_H,
     SINGLE_PATH_WINDOW_H,
     SNR_TIE_DB,
@@ -74,10 +73,14 @@ from .const import (
     TX_RESULT_MARGIN_MS,
     TX_RESULTS,
     UNREACHABLE_GRACE_MIN,
+    signal_device_added,
     signal_device_event,
     signal_device_update,
+    signal_new_reading,
+    signal_proxy_bound,
     signal_proxy_update,
 )
+from .federation import Federation, FedReception, Heard
 from .profiles import Profile, default_heartbeat, get_profile
 from .readings import reading_key
 
@@ -92,11 +95,18 @@ STATE_STORAGE_VERSION = 2
 
 CONFIRMED_TYPES = frozenset({cs.T_DATA_CONFIRMED, cs.T_HEARTBEAT_CONFIRMED, cs.T_JOIN, cs.T_SYNC})
 TICK = timedelta(seconds=5)
+AGE_CAP_MS = 1500
 TX_HISTORY = 20
 HOUR_MS = 3_600_000
 SINGLE_PATH_WINDOW = timedelta(hours=SINGLE_PATH_WINDOW_H)
 SINGLE_PATH_REPAIR = timedelta(hours=SINGLE_PATH_REPAIR_H)
-DEVICE_ISSUES = ("pairing_stalled", "device_unreachable", "single_path", "re_pair")
+DEVICE_ISSUES = (
+    "pairing_stalled",
+    "device_unreachable",
+    "single_path",
+    "single_path_federated",
+    "re_pair",
+)
 PROXY_ISSUES = ("proxy_mismatch", "shared_key")
 COMMAND_EXPIRY = timedelta(hours=COMMAND_EXPIRY_H)
 LEAVE_EXPIRY = timedelta(hours=LEAVE_EXPIRY_H)
@@ -137,6 +147,8 @@ class PendingDownlink:
     eui: str
     frame: bytes
     result: asyncio.Future[str] | None
+    # A neighbour's federated downlink: told the result and offset (09 section 7.5).
+    on_result: Callable[[str, int], None] | None = None
 
 
 @dataclass(slots=True)
@@ -204,8 +216,12 @@ class Transmission:
     answer: bool
     started_ms: int
     receptions: list[Reception] = field(default_factory=list)
+    # Copies delivered through mailboxes (07 section 4.4).
+    fed: list[FedReception] = field(default_factory=list)
     # Queued commands the answer carries; each counts a send once a proxy is asked.
     commands: list[Command] = field(default_factory=list)
+    # The answer carries a command, or NOP (09 section 9).
+    carries: bool = False
 
 
 class Proxy:
@@ -232,6 +248,9 @@ class Proxy:
         # Airtime of downlinks sent, by DOWNLINK seq: (sent at ms, airtime ms).
         self.airtime: dict[int, tuple[int, float]] = {}
         self.duty_cycle_until_ms: int | None = None
+        # Our own downlinks on the proxy's clock: (boot_id, start us, end us). A
+        # neighbour's federated downlink may not displace one (09 section 7.4).
+        self.own_tx: deque[tuple[int, int, int]] = deque(maxlen=TX_HISTORY)
 
     def rekey(self, key: bytes) -> None:
         """Take a new key. The proxy_id stays bound (05 section 4.2): messages under the
@@ -339,6 +358,11 @@ class Device:
         self.stale: set[str] = set()
         # Proxy subentry_id -> when that proxy last heard the device (07 section 9).
         self.heard_by: dict[str, datetime] = {}
+        # Federated path (server and publisher pseudonym) -> when it last delivered
+        # the device (07 section 8.2), kept apart from the proxies.
+        self.fed_heard_by: dict[str, datetime] = {}
+        # Reading keys whose value came from a federation-only frame (07 section 4.4).
+        self.fed_only: set[str] = set()
         self.single_path_since: datetime | None = None
         # Event readings seen, by reading key: each has an event entity.
         self.events: set[str] = set()
@@ -403,10 +427,26 @@ class Device:
         """Proxies that heard the device in the last 24 hours (07 section 9)."""
         return len(self.recent_proxies(_utcnow()))
 
+    def recent_federated(self, now: datetime) -> list[str]:
+        """Federated paths that delivered the device in the last 24 hours."""
+        return [p for p, t in self.fed_heard_by.items() if now - t < SINGLE_PATH_WINDOW]
+
+    @property
+    def federated_paths(self) -> list[str]:
+        """Federated paths that delivered the device in the last 24 hours."""
+        return sorted(self.recent_federated(_utcnow()))
+
+    @property
+    def federated_count(self) -> int:
+        """How many federated paths delivered the device in the last 24 hours."""
+        return len(self.federated_paths)
+
     @property
     def single_path(self) -> bool:
-        """Heard by exactly one proxy over the last 24 hours (07 section 8.2)."""
-        return self.supervised and self.proxy_count == 1
+        """Heard by exactly one proxy of our own, or only through federated paths, over
+        the last 24 hours. Federated paths never clear it (07 section 8.2)."""
+        own = self.proxy_count
+        return self.supervised and (own == 1 or (own == 0 and self.federated_count > 0))
 
     def reading_available(self, key: str) -> bool:
         """A reading is shown unless the device is unreachable or has not resent it."""
@@ -447,6 +487,8 @@ class Device:
             "unreachable": self.unreachable,
             "stale": sorted(self.stale),
             "heard_by": {sid: t.isoformat() for sid, t in self.heard_by.items()},
+            "fed_heard_by": {path: t.isoformat() for path, t in self.fed_heard_by.items()},
+            "fed_only": sorted(self.fed_only),
             "single_path_since": self.single_path_since.isoformat()
             if self.single_path_since
             else None,
@@ -491,6 +533,12 @@ class Device:
         self.heard_by = {
             sid: t for sid, v in d.get("heard_by", {}).items() if (t := _parse_time(v)) is not None
         }
+        self.fed_heard_by = {
+            path: t
+            for path, v in d.get("fed_heard_by", {}).items()
+            if (t := _parse_time(v)) is not None
+        }
+        self.fed_only = set(d.get("fed_only", []))
         self.single_path_since = _parse_time(d.get("single_path_since"))
         # Added with commands and events.
         self.events = set(d.get("events", []))
@@ -578,6 +626,9 @@ class NetworkServer(asyncio.DatagramProtocol):
         # The tag block of each device's last_fcnt in the table (07 section 3).
         self._tag_blocks: dict[str, bytes] = {}
         self._collecting: dict[bytes, Transmission] = {}
+        # Confirmed transmissions none of our proxies could answer, with their answer:
+        # a neighbour's copy may still arrive in time for RX2 (07 section 4.4).
+        self._unanswered: dict[bytes, tuple[Transmission, bytes]] = {}
         self._identified: dict[bytes, tuple[Device, int]] = {}
         self._bootstrap: deque[int] = deque()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -594,6 +645,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         self.foreign_frames = 0
         # Bootstrap frames identified by trial decryption (02 section 11.3).
         self.trial_decryptions = 0
+        self.options: dict[str, Any] = dict(entry.options)
+        self.federation: Federation | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -633,6 +686,10 @@ class NetworkServer(asyncio.DatagramProtocol):
             EVENT_HOMEASSISTANT_STOP, self._async_on_stop
         )
         _LOGGER.debug("Listening for proxies on UDP %s", self.port)
+        federation = Federation(self.hass, self, self.options)
+        if federation.enabled:
+            self.federation = federation
+            await federation.async_start()
 
     async def _async_on_stop(self, _event: Event) -> None:
         self._unsub_stop = None
@@ -645,6 +702,9 @@ class NetworkServer(asyncio.DatagramProtocol):
             if unsub:
                 unsub()
         self._unsub_tick = self._unsub_save = self._unsub_stop = None
+        if self.federation is not None:
+            await self.federation.async_stop()
+        self._unanswered.clear()
         if self._transport:
             self._closed = asyncio.get_running_loop().create_future()
             self._transport.close()
@@ -727,7 +787,9 @@ class NetworkServer(asyncio.DatagramProtocol):
                     self._identified.clear()
                     self._rebuild_tags()
                 if not initial:
-                    async_dispatcher_send(self.hass, SIGNAL_DEVICE_ADDED, device)
+                    async_dispatcher_send(
+                        self.hass, signal_device_added(self.entry.entry_id), device
+                    )
         self._check_keys()
         if not initial:
             self._schedule_save()
@@ -835,12 +897,16 @@ class NetworkServer(asyncio.DatagramProtocol):
         if device.session_keys is None or device.state not in (STATE_EXCHANGED, STATE_PAIRED):
             self._tags.remove(device.eui)
             self._tag_blocks.pop(device.eui, None)
+            if self.federation is not None:
+                self.federation.devices_changed()
             return
         assert self._tag_epoch is not None
         self._tags.update(
             device.eui, device.session_keys.k_dev_tag, self._tag_epoch, device.last_fcnt
         )
         self._tag_blocks[device.eui] = _tag_block(device.last_fcnt)
+        if self.federation is not None:
+            self.federation.devices_changed()
 
     @callback
     def _tick(self, _now: datetime) -> None:
@@ -855,6 +921,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         for proxy in self.proxies.values():
             async_dispatcher_send(self.hass, signal_proxy_update(proxy.subentry_id))
         self._supervise(_utcnow())
+        if self.federation is not None:
+            self.federation.tick(_utcnow())
 
     # ------------------------------------------------------------------ supervision
 
@@ -875,6 +943,11 @@ class NetworkServer(asyncio.DatagramProtocol):
                 changed = True
             for sid in [s for s, t in device.heard_by.items() if now - t >= SINGLE_PATH_WINDOW]:
                 del device.heard_by[sid]
+                changed = True
+            for path in [
+                p for p, t in device.fed_heard_by.items() if now - t >= SINGLE_PATH_WINDOW
+            ]:
+                del device.fed_heard_by[path]
                 changed = True
             if device.supervised and not device.unreachable:
                 heard_ms = device.last_heard_ms or self._started_ms
@@ -929,13 +1002,17 @@ class NetworkServer(asyncio.DatagramProtocol):
                 "heartbeat": str(device.supervised_minutes),
             }
         self._set_issue("device_unreachable", eui, unreachable)
-        single_path = None
+        single_path = single_path_federated = None
         since = device.single_path_since
         if since is not None and now - since >= SINGLE_PATH_REPAIR:
             sids = device.recent_proxies(now)
-            proxy = self.proxies.get(sids[0]) if sids else None
-            single_path = {"name": name, "proxy": proxy.name if proxy else "-"}
+            if sids:
+                proxy = self.proxies.get(sids[0])
+                single_path = {"name": name, "proxy": proxy.name if proxy else "-"}
+            else:
+                single_path_federated = {"name": name}
         self._set_issue("single_path", eui, single_path)
+        self._set_issue("single_path_federated", eui, single_path_federated)
         self._set_issue(
             "re_pair",
             eui,
@@ -1024,6 +1101,14 @@ class NetworkServer(asyncio.DatagramProtocol):
         ]
         device.next_command_id += 1
         _LOGGER.info("%s: %s queued", device.name, name)
+        if device.proxy_count == 0 and device.federated_count > 0:
+            # 07 section 7: only RX2 answers to confirmed uplinks reach such a device.
+            _LOGGER.info(
+                "%s is heard only through neighbours: %s goes out with its next "
+                "confirmed uplink, within its heartbeat interval",
+                device.name,
+                name,
+            )
         async_dispatcher_send(self.hass, signal_device_update(device.eui))
         await self._async_save()
         return True
@@ -1198,7 +1283,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._proxy_ids[proxy.subentry_id] = pid.hex()
         self._schedule_save()
         _LOGGER.info("Proxy %s is %s", proxy.name, pid.hex())
-        async_dispatcher_send(self.hass, SIGNAL_PROXY_BOUND, proxy)
+        async_dispatcher_send(self.hass, signal_proxy_bound(self.entry.entry_id), proxy)
 
     def _handle(self, data: bytes, addr: tuple[str, int]) -> None:
         opened = self._open(data)
@@ -1318,6 +1403,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         pending = proxy.pending_downlinks.pop(seq, None)
         if pending is not None and pending.result is not None and not pending.result.done():
             pending.result.set_result(result)
+        if pending is not None and pending.on_result is not None:
+            pending.on_result(result, t["offset_us"])
         if (
             pending is not None
             and result == "sent"
@@ -1348,6 +1435,21 @@ class NetworkServer(asyncio.DatagramProtocol):
         reception = Reception(proxy, boot_id, u["rx_time_us"], u["rssi"], u["snr"], u["flags"])
         identified = self._identify(frame, h, now_ms)
         if identified is None:
+            # No device of ours verified it: a neighbour's, perhaps (09 section 6.1).
+            if self.federation is not None and not proxy.radio_mismatch:
+                self.federation.heard(
+                    Heard(
+                        proxy,
+                        boot_id,
+                        u["rx_time_us"],
+                        u["rssi"],
+                        u["snr"],
+                        u["flags"],
+                        now_ms,
+                    ),
+                    frame,
+                    h,
+                )
             return
         device, keys, plaintext = identified
         got = device.uplinks.receive(frame, now_ms)
@@ -1370,26 +1472,92 @@ class NetworkServer(asyncio.DatagramProtocol):
         tx = Transmission(
             frame, h, device, keys, plaintext, got["counter"], got["answer"], now_ms, [reception]
         )
-        self._collecting[frame] = tx
+        self._start(tx)
+
+    def _start(self, tx: Transmission) -> None:
+        """Collect a new transmission, act on it and answer it (07 section 4)."""
+        self._collecting[tx.frame] = tx
         task = self.hass.async_create_background_task(
-            self._process(tx), f"{DOMAIN} uplink {device.eui}"
+            self._process(tx), f"{DOMAIN} uplink {tx.device.eui}"
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def federated_uplink(
+        self, frame: bytes, h: cs.ParsedHeader, fed: list[FedReception], arrived_ms: int
+    ) -> None:
+        """A frame delivered by a mailbox: processed like a copy from a proxy, from step
+        2 of 07 section 4, and identified by table lookup only (07 section 4.4)."""
+        try:
+            identified = self._identify(frame, h, arrived_ms, local=False)
+        except Exception:
+            _LOGGER.exception("Error identifying a federated frame")
+            return
+        if identified is None:
+            return
+        device, keys, plaintext = identified
+        # Received age_ms before its delivery arrived (07 section 4.3).
+        # The age is the publisher's claim: capped as the server caps it (09 7.2), so a
+        # retry cannot be passed off as a copy.
+        age = min(AGE_CAP_MS, max(r.age_ms for r in fed))
+        got = device.uplinks.receive(frame, arrived_ms, age)
+        block = self._tag_blocks.get(device.eui)
+        if block is not None and block != _tag_block(device.last_fcnt):
+            self._update_tags(device)
+        if got.get("counter") != "too_old":
+            new_path = any(r.path not in device.fed_heard_by for r in fed)
+            now = _utcnow()
+            for r in fed:
+                device.fed_heard_by[r.path] = now
+            if new_path:
+                async_dispatcher_send(self.hass, signal_device_update(device.eui))
+        if got["result"] == "copy":
+            if (tx := self._collecting.get(frame)) is not None:
+                tx.fed.extend(fed)
+            elif (
+                (waiting := self._unanswered.get(frame)) is not None
+                and arrived_ms - waiting[0].started_ms < RX2_OFFSET_US // 1000
+                and self.federation is not None
+            ):
+                tx, downlink = waiting
+                tx.fed.extend(fed)
+                task = self.hass.async_create_background_task(
+                    self._request_late(tx, downlink), f"{DOMAIN} federated request {device.eui}"
+                )
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+            return
+        if got["counter"] == "too_old":
+            return
+        tx = Transmission(
+            frame, h, device, keys, plaintext, got["counter"], got["answer"], arrived_ms, [], fed
+        )
+        self._start(tx)
+
+    async def _request_late(self, tx: Transmission, downlink: bytes) -> None:
+        if self.federation is not None and await self.federation.request(tx, downlink, tx.carries):
+            self._unanswered.pop(tx.frame, None)
+
     def _identify(
-        self, frame: bytes, h: cs.ParsedHeader, now_ms: int
+        self, frame: bytes, h: cs.ParsedHeader, now_ms: int, local: bool = True
     ) -> tuple[Device, cs.DeviceKeys, bytes] | None:
-        """07 section 4, step 4. Copies reuse the first copy's identification."""
+        """07 section 4, step 4. Copies reuse the first copy's identification. A frame
+        that is not local (a federated one) is identified by lookup only (4.4)."""
         self._identified = {
             f: v for f, v in self._identified.items() if now_ms - v[1] < cs.FRAME_MEMORY_MS
         }
         known = self._identified.get(frame)
         if known is not None and (opened := self._try(known[0], frame, h.ftype)) is not None:
             return opened
+        if not local and h.ftype == cs.T_JOIN:
+            return None  # pairing is never federated (09 section 8)
 
-        # Every proxy here is the server's own, so every frame is heard locally.
-        route, euis = cs.identify_route(self._tags, frame, local=True)
+        route, euis = cs.identify_route(self._tags, frame, local=local)
+        if not local and self.federation is not None:
+            # The registered SYNC window reaches past the table's (09 section 5.5).
+            extra = [e for e in self.federation.lookup(h.tag) if e not in euis]
+            if extra:
+                route, euis = "table", [*euis, *extra]
         tried: list[Device] = []
         for eui in euis:
             if (device := self._device(eui)) is None:
@@ -1400,7 +1568,7 @@ class NetworkServer(asyncio.DatagramProtocol):
                 return opened
         # A bootstrap frame that missed the table, or whose candidates all failed the
         # MIC, is tried against every device (02 section 11.3).
-        if cs.is_bootstrap(h.ftype) and route != "drop":
+        if local and cs.is_bootstrap(h.ftype) and route != "drop":
             if not self._bootstrap_allowed(now_ms):
                 return None  # dropped unprocessed (07 section 4, step 4)
             for _, device in self._all_devices():
@@ -1480,10 +1648,11 @@ class NetworkServer(asyncio.DatagramProtocol):
             return None
         fresh = tx.counter in ("accept", "accept_late")
         if fresh:
-            best = max(tx.receptions, key=lambda r: r.snr)
             device.last_seen = _utcnow()
             device.last_heard_ms = _now_ms()
-            device.rssi, device.snr = best.rssi, best.snr
+            if tx.receptions:  # signal figures are our own proxies' (07 section 9)
+                best = max(tx.receptions, key=lambda r: r.snr)
+                device.rssi, device.snr = best.rssi, best.snr
             self._reachable_again(device)
 
         if h.ftype == cs.T_JOIN:
@@ -1509,11 +1678,15 @@ class NetworkServer(asyncio.DatagramProtocol):
 
         queued = device.state == STATE_PAIRED
         self._settle(device, h.fcnt, tx.counter, bool(uflags & cs.UF_DL_ACK))
+        if self.federation is not None:
+            self.federation.uplink(device, h.fcnt, tx.counter, bool(uflags & cs.UF_DL_ACK))
         leaving = device.leaving_since is not None
         if leaving and device.eui not in self.leaving:
             return None  # LEAVE acknowledged or given up: the record is gone
         if fresh and not leaving:
-            self._apply_readings(device, tx.plaintext[1:])
+            # Heard so far only through mailboxes: federation-only (07 section 4.4).
+            # Our proxies' copies arrive first, so a later one is rare.
+            self._apply_readings(device, tx.plaintext[1:], federation_only=not tx.receptions)
             self._schedule_save()
             async_dispatcher_send(self.hass, signal_device_update(device.eui))
 
@@ -1528,6 +1701,18 @@ class NetworkServer(asyncio.DatagramProtocol):
             dflags = cs.DF_PENDING if more else 0
         if not (tx.answer or taken or (fresh and uflags & cs.UF_TIME_UNSURE)):
             return None
+        if (
+            not commands
+            and not tx.receptions
+            and queued
+            and latest
+            and self.federation is not None
+            and self.federation.owner
+        ):
+            # A federated answer carries NOP, so the sensor's DL_ACK can credit the
+            # publisher (09 section 7.7).
+            commands = cs.command(cs.CMD_NOP, b"")
+        tx.carries = bool(commands)
         assert device.session_keys is not None
         fcnt = await self._next_fcnt_down(device)
         if fcnt is None:
@@ -1619,8 +1804,12 @@ class NetworkServer(asyncio.DatagramProtocol):
         device.fcnt_down = value
         return value
 
-    def _apply_readings(self, device: Device, data: bytes) -> None:
-        """Update reading values (03 section 6). An invalid payload applies nothing."""
+    def _apply_readings(self, device: Device, data: bytes, federation_only: bool = False) -> None:
+        """Update reading values (03 section 6). An invalid payload applies nothing.
+
+        Readings and events of a federation-only frame are marked, or ignored if the
+        user chose to (07 section 4.4).
+        """
         if not data:
             return
         try:
@@ -1628,6 +1817,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         except ValueError as err:
             _LOGGER.warning("%s sent invalid readings: %s", device.name, err)
             return
+        skip_readings = federation_only and self.options.get(CONF_IGNORE_FEDERATED_READINGS)
+        skip_events = federation_only and self.options.get(CONF_IGNORE_FEDERATED_EVENTS)
         for r in readings:
             name, value = r["name"], r["value"]
             if name == "firmware_version":
@@ -1638,19 +1829,28 @@ class NetworkServer(asyncio.DatagramProtocol):
                     self._set_sw_version(device.eui, version)
                 continue
             if name == "button":
-                self._event(device, r["channel"], name, value)
+                if not skip_events:
+                    self._event(device, r["channel"], name, value, federation_only)
                 continue
-            if name in ("unknown", "raw", "text"):
+            if name in ("unknown", "raw", "text") or skip_readings:
                 continue
             key = reading_key(r["channel"], name)
             new = key not in device.entity_keys()
             device.readings[key] = value
             device.stale.discard(key)
+            if federation_only:
+                device.fed_only.add(key)
+            else:
+                device.fed_only.discard(key)
             if new:
-                async_dispatcher_send(self.hass, SIGNAL_NEW_READING, device, key)
+                async_dispatcher_send(
+                    self.hass, signal_new_reading(self.entry.entry_id), device, key
+                )
 
     @callback
-    def _event(self, device: Device, channel: int, kind: str, value: int) -> None:
+    def _event(
+        self, device: Device, channel: int, kind: str, value: int, federation_only: bool = False
+    ) -> None:
         """An event reading: fires the event entity and a bus event, never a state
         (03 section 5, 07 section 11.3)."""
         event_type = BUTTON_EVENTS.get(value)
@@ -1658,14 +1858,25 @@ class NetworkServer(asyncio.DatagramProtocol):
             _LOGGER.debug("%s: %s value %s is not an event type", device.name, kind, value)
             return
         key = reading_key(channel, kind)
+        if federation_only:
+            device.fed_only.add(key)
+        else:
+            device.fed_only.discard(key)
         if key not in device.entity_keys():
             device.events.add(key)
             device.first_events[key] = event_type
-            async_dispatcher_send(self.hass, SIGNAL_NEW_READING, device, key)
+            async_dispatcher_send(self.hass, signal_new_reading(self.entry.entry_id), device, key)
         else:
             device.events.add(key)
             async_dispatcher_send(self.hass, signal_device_event(device.eui), key, event_type)
-        self._fire(EVENT_READING, device, channel=channel, kind=kind, event_type=event_type)
+        self._fire(
+            EVENT_READING,
+            device,
+            channel=channel,
+            kind=kind,
+            event_type=event_type,
+            federation_only=federation_only,
+        )
 
     def _candidates(self, tx: Transmission, airtime: float) -> list[Reception]:
         """Receptions whose proxy may answer (07 section 6.1), within its airtime budget."""
@@ -1706,6 +1917,21 @@ class NetworkServer(asyncio.DatagramProtocol):
                     "%s: no proxy can answer frame %s in RX1", tx.device.name, tx.header.fcnt
                 )
             return
+        if not candidates and not rx1 and self.federation is not None and self.federation.owner:
+            # None of our proxies can answer: one federated RX2 request, never both
+            # (07 sections 4.4 and 6.3). Copies that come later may still make it.
+            if not (tx.fed and await self.federation.request(tx, downlink, tx.carries)) and (
+                # A copy that came while the first try was ranked gets one more.
+                not tx.fed or not await self.federation.request(tx, downlink, tx.carries)
+            ):
+                now_ms = _now_ms()
+                self._unanswered = {
+                    f: v
+                    for f, v in self._unanswered.items()
+                    if now_ms - v[0].started_ms < RX2_OFFSET_US // 1000
+                }
+                self._unanswered[tx.frame] = (tx, downlink)
+            return
         if not candidates:
             _LOGGER.debug(
                 "%s: no proxy can answer frame %s%s",
@@ -1732,10 +1958,11 @@ class NetworkServer(asyncio.DatagramProtocol):
             proxy, cs.M_DOWNLINK, cs.downlink_msg_body(reception.rx_time_us, offset, downlink)
         )
         proxy.downlinks_sent += 1
-        # RX2 after RX1 resends the same frame: one send of its commands.
-        for c in tx.commands:
-            c.sends += 1
-        tx.commands = []
+        self.federated_request_sent(tx)
+        start = reception.rx_time_us + offset
+        proxy.own_tx.append((reception.boot_id, start, start + int(airtime * 1000)))
+        if self.federation is not None:
+            self.federation.answered_locally(tx)
         proxy.airtime[seq] = (_now_ms(), airtime)
         future: asyncio.Future[str] | None = self.hass.loop.create_future() if wait else None
         proxy.pending_downlinks[seq] = PendingDownlink(tx.device.eui, downlink, future)
@@ -1761,6 +1988,82 @@ class NetworkServer(asyncio.DatagramProtocol):
             proxy.tx_results.append(("no_result", 0))
             _LOGGER.debug("%s: no TX_RESULT for the %s downlink in time", proxy.name, window)
             return None
+
+    # ------------------------------------------------------------------ federation
+
+    def clock(self) -> int:
+        """Monotonic milliseconds, as the rest of the server counts them."""
+        return _now_ms()
+
+    def unix(self) -> int:
+        """Unix seconds (tags, registration expiry)."""
+        return _unix()
+
+    def utcnow(self) -> datetime:
+        """Wall-clock time (repairs)."""
+        return _utcnow()
+
+    @callback
+    def set_issue(self, key: str, subject: str, placeholders: dict[str, str] | None) -> None:
+        """Raise or clear a repair issue on behalf of the federation client."""
+        self._set_issue(key, subject, placeholders)
+
+    def federated_devices(self) -> Iterator[tuple[str, bytes, int, int, int]]:
+        """Devices whose tags an owner registers: (dev_eui, k_dev_tag, last_fcnt, seconds
+        since last heard, heartbeat minutes). Fresh keys count at once (09 5.3)."""
+        now = _utcnow()
+        for eui, device in self._all_devices():
+            if device.session_keys is None or device.state not in (STATE_EXCHANGED, STATE_PAIRED):
+                continue
+            seen = device.last_seen
+            silence = max(0, int((now - seen).total_seconds())) if seen else 0
+            yield (
+                eui,
+                device.session_keys.k_dev_tag,
+                device.last_fcnt,
+                silence,
+                device.supervised_minutes,
+            )
+
+    def federated_request_sent(self, tx: Transmission) -> None:
+        """A downlink went out for the transmission: one send of its commands (an RX2
+        resend after RX1 is the same frame)."""
+        for c in tx.commands:
+            c.sends += 1
+        tx.commands = []
+
+    def proxy_current(self, proxy: Proxy) -> bool:
+        """The proxy has not been removed."""
+        return self.proxies.get(proxy.subentry_id) is proxy
+
+    def own_downlink_overlaps(self, proxy: Proxy, start_us: int, airtime: float) -> bool:
+        """Whether a transmission at start_us on the proxy's clock would overlap one of
+        our own downlinks there (09 section 7.4, check 6)."""
+        end = start_us + int(airtime * 1000)
+        boot = proxy.link.boot_id
+        return any(b == boot and a < end and start_us < z for b, a, z in proxy.own_tx)
+
+    def transmit_for_neighbour(
+        self,
+        proxy: Proxy,
+        rx_time_us: int,
+        downlink: bytes,
+        airtime: float,
+        on_result: Callable[[str, int], None],
+    ) -> int | None:
+        """Send a neighbour's RX2 answer through one of our proxies (09 section 7.4).
+        Returns the DOWNLINK seq, or None if the proxy cannot take it now."""
+        if not self.proxy_current(proxy) or not proxy.can_downlink:
+            return None
+        seq = self._send(
+            proxy, cs.M_DOWNLINK, cs.downlink_msg_body(rx_time_us, RX2_OFFSET_US, downlink)
+        )
+        proxy.downlinks_sent += 1
+        proxy.airtime[seq] = (_now_ms(), airtime)
+        proxy.pending_downlinks[seq] = PendingDownlink("", downlink, None, on_result)
+        while len(proxy.pending_downlinks) > TX_HISTORY:
+            del proxy.pending_downlinks[next(iter(proxy.pending_downlinks))]
+        return seq
 
     # ------------------------------------------------------------------ diagnostics
 
@@ -1794,6 +2097,7 @@ class NetworkServer(asyncio.DatagramProtocol):
                     "known_profile": d.profile_def is not None,
                     "heartbeat_minutes": d.heartbeat_minutes,
                     "single_path": d.single_path,
+                    "federated_paths": d.federated_count,
                 }
                 for eui, d in self.devices.items()
             },
@@ -1801,6 +2105,7 @@ class NetworkServer(asyncio.DatagramProtocol):
                 eui: d.to_store() | {"since": d.leaving_since} for eui, d in self.leaving.items()
             },
             "root_counters": dict(self._root_data()),
+            "federation": self.federation.diagnostics() if self.federation else None,
         }
 
 

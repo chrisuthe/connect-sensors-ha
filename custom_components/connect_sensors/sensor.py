@@ -24,12 +24,12 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ConnectSensorsConfigEntry
 from .const import (
-    SIGNAL_DEVICE_ADDED,
-    SIGNAL_NEW_READING,
-    SIGNAL_PROXY_BOUND,
     STATE_EXCHANGED,
     STATE_PAIRED,
     STATE_SCANNED,
+    signal_device_added,
+    signal_new_reading,
+    signal_proxy_bound,
 )
 from .entity import DeviceEntity, ProxyEntity, ReadingEntity
 from .readings import SENSOR_KINDS, SENSOR_STATE_CLASS, split_reading_key
@@ -114,6 +114,14 @@ DEVICE_SENSORS: tuple[DeviceSensorDescription, ...] = (
         attributes_fn=lambda d: {"single_path": d.single_path},
     ),
     DeviceSensorDescription(
+        key="federated_paths",
+        translation_key="federated_paths",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda d: d.federated_count if d.supervised else None,
+        attributes_fn=lambda d: {"paths": d.federated_paths},
+    ),
+    DeviceSensorDescription(
         key="command",
         translation_key="command",
         device_class=SensorDeviceClass.ENUM,
@@ -191,9 +199,15 @@ async def async_setup_entry(
     for proxy in server.proxies.values():
         if proxy.proxy_id is not None:
             add_proxy(proxy)
-    entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_DEVICE_ADDED, add_device))
-    entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_NEW_READING, add_reading))
-    entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_PROXY_BOUND, add_proxy))
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, signal_device_added(entry.entry_id), add_device)
+    )
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, signal_new_reading(entry.entry_id), add_reading)
+    )
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, signal_proxy_bound(entry.entry_id), add_proxy)
+    )
 
 
 def _readings(device: Device, keys: list[str]) -> list[SensorEntity]:

@@ -8,11 +8,16 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import config_validation as cv, issue_registry as ir
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    issue_registry as ir,
+)
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
+from .entity import mailbox_device_id
 from .server import STATE_STORAGE_KEY, STATE_STORAGE_VERSION, NetworkServer
 from .services import async_setup_services
 
@@ -57,15 +62,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConnectSensorsConfigEntr
             translation_placeholders={"port": str(server.port), "error": str(err)},
         ) from err
     entry.runtime_data = server
+    _remove_old_mailboxes(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
 
 
+def _remove_old_mailboxes(hass: HomeAssistant, entry: ConnectSensorsConfigEntry) -> None:
+    """Drop the devices of mailbox servers no longer in use."""
+    federation = entry.runtime_data.federation
+    servers = federation.servers.values() if federation else ()
+    keep = {mailbox_device_id(entry.entry_id, s) for s in servers}
+    registry = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(registry, entry.entry_id):
+        ids = {i for d, i in device.identifiers if d == DOMAIN}
+        if any(i.startswith("mailbox_") for i in ids) and not ids & keep:
+            registry.async_update_device(device.id, remove_config_entry_id=entry.entry_id)
+
+
 async def _async_update_listener(hass: HomeAssistant, entry: ConnectSensorsConfigEntry) -> None:
-    """Subentries added or removed are picked up live; a new port needs a reload."""
+    """Subentries added or removed are picked up live; a new port or new federation
+    options need a reload."""
     server = entry.runtime_data
-    if entry.data[CONF_PORT] != server.port:
+    if entry.data[CONF_PORT] != server.port or dict(entry.options) != server.options:
         hass.config_entries.async_schedule_reload(entry.entry_id)
         return
     server.async_sync_subentries()

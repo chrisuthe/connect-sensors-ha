@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import secrets
+import ssl
 from typing import Any
+from urllib.parse import urlsplit
 
 import connectsensors as cs
 from homeassistant.components.network import async_get_source_ip
@@ -12,11 +14,13 @@ from homeassistant.config_entries import (
     ConfigFlow,
     ConfigFlowResult,
     ConfigSubentryFlow,
+    OptionsFlow,
     SubentryFlowResult,
 )
 from homeassistant.const import CONF_NAME, CONF_PORT
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -24,14 +28,23 @@ from homeassistant.helpers.selector import (
     SelectSelectorConfig,
     SelectSelectorMode,
     TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
 )
 import probatio
 
 from .const import (
     CONF_DEV_EUI,
+    CONF_FEDERATION_DOWNLINKS,
+    CONF_FEDERATION_OWNER,
+    CONF_FEDERATION_PUBLISH,
     CONF_HEARTBEAT,
+    CONF_IGNORE_FEDERATED_EVENTS,
+    CONF_IGNORE_FEDERATED_READINGS,
     CONF_K_ROOT,
     CONF_KEY,
+    CONF_MAILBOX_CERTIFICATE,
+    CONF_MAILBOX_SERVERS,
     CONF_PAIRING_CODE,
     CONF_PROFILE,
     CONF_REGION,
@@ -137,6 +150,12 @@ class ConnectSensorsConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
         )
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> FederationOptionsFlow:
+        """Federation through mailbox servers (spec 09)."""
+        return FederationOptionsFlow()
+
     @classmethod
     @callback
     def async_get_supported_subentry_types(
@@ -144,6 +163,76 @@ class ConnectSensorsConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> dict[str, type[ConfigSubentryFlow]]:
         """Proxies and devices."""
         return {SUBENTRY_PROXY: ProxySubentryFlow, SUBENTRY_DEVICE: DeviceSubentryFlow}
+
+
+OPT_INS = (CONF_FEDERATION_OWNER, CONF_FEDERATION_PUBLISH, CONF_FEDERATION_DOWNLINKS)
+FEDERATION_FLAGS = (*OPT_INS, CONF_IGNORE_FEDERATED_EVENTS, CONF_IGNORE_FEDERATED_READINGS)
+
+
+def mailbox_url_error(url: str) -> str | None:
+    """Why a mailbox URL cannot be used: 09 section 12.1 requires wss://."""
+    try:
+        parts = urlsplit(url)
+        parts.port  # noqa: B018 - raises for a bad port
+    except ValueError:
+        return "invalid_url"
+    if parts.scheme != "wss" or not parts.hostname:
+        return "invalid_url"
+    return None
+
+
+def certificate_error(pem: str) -> str | None:
+    """Whether a pasted certificate can be trusted for the mailbox servers."""
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=pem)
+    except ssl.SSLError, ValueError:
+        return "invalid_certificate"
+    return None
+
+
+class FederationOptionsFlow(OptionsFlow):
+    """Mailbox servers and the three federation opt-ins, each off by default (09)."""
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """One form: servers, an optional pinned certificate and the opt-ins."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            urls = [u.strip() for u in user_input.get(CONF_MAILBOX_SERVERS, []) if u.strip()]
+            pem = (user_input.get(CONF_MAILBOX_CERTIFICATE) or "").strip()
+            if any(mailbox_url_error(u) for u in urls):
+                errors[CONF_MAILBOX_SERVERS] = "invalid_url"
+            elif not urls and any(user_input.get(k) for k in OPT_INS):
+                errors[CONF_MAILBOX_SERVERS] = "no_servers"
+            if pem and certificate_error(pem):
+                errors[CONF_MAILBOX_CERTIFICATE] = "invalid_certificate"
+            if not errors:
+                options: dict[str, Any] = {
+                    CONF_MAILBOX_SERVERS: list(dict.fromkeys(urls)),
+                    **{k: bool(user_input.get(k)) for k in FEDERATION_FLAGS},
+                }
+                if pem:
+                    options[CONF_MAILBOX_CERTIFICATE] = pem
+                return self.async_create_entry(data=options)
+        current = user_input or self.config_entry.options
+        return self.async_show_form(
+            step_id="init",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Optional(
+                        CONF_MAILBOX_SERVERS, default=list(current.get(CONF_MAILBOX_SERVERS, []))
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL, multiple=True)),
+                    **{
+                        probatio.Optional(k, default=bool(current.get(k, False))): BooleanSelector()
+                        for k in FEDERATION_FLAGS
+                    },
+                    probatio.Optional(
+                        CONF_MAILBOX_CERTIFICATE,
+                        description={"suggested_value": current.get(CONF_MAILBOX_CERTIFICATE, "")},
+                    ): TextSelector(TextSelectorConfig(multiline=True)),
+                }
+            ),
+            errors=errors,
+        )
 
 
 class ProxySubentryFlow(ConfigSubentryFlow):

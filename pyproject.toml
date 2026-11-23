@@ -9,7 +9,9 @@ dependencies = []
 
 [dependency-groups]
 dev = [
-    "connectsensors==0.4.0",
+    "connectsensors==0.4.1",
+    # The reference mailbox server (spec 09), run by the federation tests.
+    "cs-mailbox @ git+https://github.com/chrisuthe/ConnectSensors@8f710619d1a33be7050e772bd8c7efc11a84a21d#subdirectory=mailbox",
     "mypy==2.4.1",
     "pytest-homeassistant-custom-component==0.13.375",
     "ruff==0.17.6",
@@ -17,6 +19,9 @@ dev = [
 
 [tool.uv]
 package = false
+# cs-mailbox points connectsensors at its own checkout; test against the PyPI release
+# the integration requires instead.
+no-sources = true
 
 [tool.ruff]
 target-version = "py314"
@@ -50,3 +55,4 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+

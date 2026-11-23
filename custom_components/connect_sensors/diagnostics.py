@@ -16,6 +16,9 @@ TO_REDACT = {
     "k_session",
     "sensor_pub",
     "frame",
+    # Owner keys (09 section 5.4); the federation never reports them, but be sure.
+    "client_seed",
+    "seed",
 }
 
 
