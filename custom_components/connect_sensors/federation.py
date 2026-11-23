@@ -33,7 +33,8 @@ from urllib.parse import urlsplit
 import aiohttp
 import connectsensors as cs
 
-# The 09 helpers are not in the package's public surface yet; they are the same
+# The 09 helpers are not in the package's public surface yet
+# (chrisuthe/ConnectSensors#101); they are the same
 # reference module, which cs-mailbox imports the same way.
 from connectsensors import _csframe as csf
 from homeassistant.core import HomeAssistant, callback
@@ -639,7 +640,8 @@ class Federation:
         _LOGGER.info("Mailbox %s connected", s.url)
         # Every live tag again on each connection: cheap, and it covers a new
         # generation or server key (09 sections 5.3 and 12.3).
-        s.registered.clear()
+        async with s.lock:
+            s.registered.clear()
         await link.ping()
         if self.owner:
             await self._register(s)
@@ -949,7 +951,9 @@ class Federation:
 
         def expire() -> None:
             # Not re-requested before the server's own timeout (09 section 7.5).
-            r.server.pending.pop(seq, None)
+            # seq restarts on each connection: only this request's entry.
+            if r.server.pending.get(seq, ("", None))[1] is req:
+                r.server.pending.pop(seq)
             if self._requests.get(tx_id) is req and req.current is r:
                 self._requests.pop(tx_id, None)
 

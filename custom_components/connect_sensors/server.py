@@ -704,6 +704,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._unsub_tick = self._unsub_save = self._unsub_stop = None
         if self.federation is not None:
             await self.federation.async_stop()
+        self._unanswered.clear()
         if self._transport:
             self._closed = asyncio.get_running_loop().create_future()
             self._transport.close()
@@ -1916,10 +1917,13 @@ class NetworkServer(asyncio.DatagramProtocol):
                     "%s: no proxy can answer frame %s in RX1", tx.device.name, tx.header.fcnt
                 )
             return
-        if not candidates and not rx1 and self.federation is not None:
+        if not candidates and not rx1 and self.federation is not None and self.federation.owner:
             # None of our proxies can answer: one federated RX2 request, never both
             # (07 sections 4.4 and 6.3). Copies that come later may still make it.
-            if not (tx.fed and await self.federation.request(tx, downlink, tx.carries)):
+            if not (tx.fed and await self.federation.request(tx, downlink, tx.carries)) and (
+                # A copy that came while the first try was ranked gets one more.
+                not tx.fed or not await self.federation.request(tx, downlink, tx.carries)
+            ):
                 now_ms = _now_ms()
                 self._unanswered = {
                     f: v
