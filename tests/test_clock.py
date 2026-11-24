@@ -12,7 +12,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.connect_sensors.server import NetworkServer
 
-from .common import pair, uplink_answered, uplink_unanswered
+from .common import full_state, pair, uplink_answered, uplink_unanswered
 from .conftest import DEV_EUI, Clock, Unix, tick
 from .sim import SimProxy, SimSensor
 
@@ -114,3 +114,24 @@ async def test_corrections_are_limited(
     await proxy.recv(cs.M_SERVER_STATUS)
     await uplink_answered(hass, proxy, sensor)
     assert caplog.text.count(LIMITED) == 1
+
+
+async def test_late_arrival_is_not_corrected(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    unix: Unix,
+) -> None:
+    """A skewed frame that arrives after a later one gets no correction: the sensor
+    would reject an answer to it (02 section 10.2). It does not use up the limit."""
+    right = await paired_at(hass, proxy, sensor, unix, EPOCH // 2)
+    sensor.clock_offset = right - EPOCH
+    late = sensor.uplink(cs.T_HEARTBEAT, full_state(0))
+    sensor.clock_offset = right
+    await uplink_unanswered(hass, proxy, sensor)
+    proxy.uplink(late)
+    await proxy.nothing()
+
+    sensor.clock_offset = right - EPOCH
+    await uplink_answered(hass, proxy, sensor)

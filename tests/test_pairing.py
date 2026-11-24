@@ -243,3 +243,26 @@ async def test_deadline_survives_restart(
     device = server.devices[DEV_EUI]
     assert device.expired and device.pairing_deadline == deadline
     assert state_of(hass, PAIRING).state == "expired"
+
+
+async def test_exchange_in_progress_outlives_the_deadline(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    wall: WallClock,
+) -> None:
+    """The deadline ends SCANNED only: an EXCHANGED device still answers a JOIN past
+    it, and pairs (04 section 4.2)."""
+    await proxy.connect()
+    await wall.advance(timedelta(minutes=9))
+    await reconnect(proxy)
+    rx = proxy.uplink(sensor.join())
+    await answer(proxy, rx)
+    await hass.async_block_till_done()
+    assert state_of(hass, PAIRING).state == "exchanged"
+
+    await wall.advance(timedelta(minutes=1, seconds=30))
+    await reconnect(proxy)
+    await pair(hass, proxy, sensor)
+    assert state_of(hass, PAIRING).state == "paired"

@@ -470,9 +470,12 @@ class Device:
         return not self.unreachable and key not in self.stale
 
     def pairing_open(self, now: datetime) -> bool:
-        """A JOIN may be answered: not paired, and before the pairing deadline."""
+        """A JOIN may be answered. The deadline ends SCANNED only: an exchange in
+        progress still answers JOINs until it times out (04 section 4.2)."""
+        if self.state == STATE_EXCHANGED:
+            return True
         return (
-            self.state != STATE_PAIRED
+            self.state == STATE_SCANNED
             and not self.expired
             and (self.pairing_deadline is None or now < self.pairing_deadline)
         )
@@ -1056,7 +1059,6 @@ class NetworkServer(asyncio.DatagramProtocol):
         is no longer tried and its pending exchange is discarded; the root counter stays
         (02 section 8.4)."""
         device.expired = True
-        device.expired_join_logged = False
         device.join.pending = None
         self._clear_stall(device)
         _LOGGER.info("%s: pairing expired; use Start pairing to try again", device.name)
@@ -1818,7 +1820,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         if queued and device.commands and latest and (fresh or tx.answer):
             commands, taken, more = self._take_commands(device)
             dflags = cs.DF_PENDING if more else 0
-        correct = fresh and self._correct_clock(tx, uflags)
+        # A late arrival's answer would be rejected (02 section 10.2).
+        correct = fresh and latest and self._correct_clock(tx, uflags)
         if not (tx.answer or taken or correct):
             return None
         if (
