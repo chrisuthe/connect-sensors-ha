@@ -35,7 +35,9 @@ Without HACS, copy `custom_components/connect_sensors` into your configuration's
    battery compartment, then press the device's button. The device's *Pairing*
    entity goes from *Waiting for button press* to *Exchanging keys* to *Paired*, and
    its entities appear: those its profile lists straight away, others with the first
-   readings that carry them.
+   readings that carry them. Press the button within 10 minutes of adding the device;
+   after that the pairing shows *Expired* and the button press is ignored. The
+   device's *Start pairing* button gives another 10 minutes.
 4. **Removing a device** sends it `LEAVE` on its next uplink, if it is reachable, so it
    returns to unpaired. Home Assistant forgets it once it acknowledges, or after 48
    hours. Adding it again later just needs its pairing code and a button press.

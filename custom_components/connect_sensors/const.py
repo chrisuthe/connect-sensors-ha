@@ -42,6 +42,18 @@ STATE_PAIRED: Final = "paired"
 # Spec 04 section 4.2: EXCHANGED falls back to SCANNED when no uplink under the pending
 # k_session verifies within 2 minutes.
 EXCHANGED_TIMEOUT_S: Final = 120
+# Spec 04 section 4.2: SCANNED ends 10 minutes after the pairing code was entered. The
+# device is not discarded but expires, until the user starts pairing again.
+PAIRING_DEADLINE_S: Final = 600
+# Pairing sensor value of an expired device.
+PAIRING_EXPIRED: Final = "expired"
+
+# Spec 07 section 4, step 7: a neighbouring epoch's tag is skew only this far from a
+# boundary.
+SKEW_MARGIN_S: Final = 300
+# A sensor whose clock stays wrong gets a correction on an otherwise unanswered uplink
+# at most this often (07 section 5).
+CORRECTION_INTERVAL_S: Final = 600
 
 # Spec 07 section 4.1 and 4.2.
 COLLECTION_WINDOW_MS: Final = 150

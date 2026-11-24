@@ -2,49 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Generator
-from datetime import timedelta
 import time
 from unittest.mock import patch
 
 import connectsensors as cs
 from homeassistant.core import HomeAssistant
-from homeassistant.util import dt as dt_util
-import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.connect_sensors.server import NetworkServer
 
 from .common import answer, full_state, pair, uplink_answered, uplink_unanswered
-from .conftest import DEV_EUI
+from .conftest import DEV_EUI, Unix, tick
 from .sim import SimProxy, SimSensor
-
-
-class Unix:
-    """The server's Unix time, ahead of real time by a settable offset."""
-
-    def __init__(self) -> None:
-        self.offset = 0
-
-    def __call__(self) -> int:
-        return int(time.time()) + self.offset
-
-
-@pytest.fixture
-def unix() -> Generator[Unix]:
-    """Control the server's Unix time (epochs and tags)."""
-    u = Unix()
-    with patch("custom_components.connect_sensors.server._unix", u):
-        yield u
-
-
-async def tick(hass: HomeAssistant) -> None:
-    """Run the server's 5-second tick."""
-    # Firing timers early would also expire in-flight TX_RESULT waits.
-    await asyncio.sleep(0.1)
-    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=6))
-    await hass.async_block_till_done()
 
 
 async def test_rotation_at_epoch_boundary(
