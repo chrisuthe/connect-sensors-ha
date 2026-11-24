@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
 - **Pairing deadline** (spec 04 section 4.2): a device must be paired within 10 minutes
   of entering its code. After that its *Pairing* entity shows *Expired*, its root key
