@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Require **connectsensors 0.4.2**, and take the federation (spec 09) helpers from its
+  public API instead of the private `connectsensors._csframe` module. No behaviour change.
+
 ## 0.2.0
 
 - **Federation** through mailbox servers (ConnectSensors spec 09). There are three

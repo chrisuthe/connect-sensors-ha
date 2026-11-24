@@ -9,7 +9,7 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/chrisuthe/connect-sensors-ha/issues",
   "loggers": ["connectsensors"],
-  "requirements": ["connectsensors==0.4.1"],
+  "requirements": ["connectsensors==0.4.2"],
   "single_config_entry": true,
-  "version": "0.2.0"
+  "version": "0.2.1"
 }

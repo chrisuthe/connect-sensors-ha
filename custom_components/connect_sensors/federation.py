@@ -32,11 +32,6 @@ from urllib.parse import urlsplit
 
 import aiohttp
 import connectsensors as cs
-
-# The 09 helpers are not in the package's public surface yet
-# (chrisuthe/ConnectSensors#101); they are the same
-# reference module, which cs-mailbox imports the same way.
-from connectsensors import _csframe as csf
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -99,7 +94,7 @@ MINUTE_MS = 60_000
 # 09 section 12.1 requires TLS.
 ALLOW_INSECURE = False
 
-CODE = {name: i for i, name in enumerate(csf.MB_ERRORS)}
+CODE = {name: i for i, name in enumerate(cs.MB_ERRORS)}
 RESULT_CODE = {name: code for code, name in TX_RESULTS.items()}
 CONFIRMED = frozenset({cs.T_DATA_CONFIRMED, cs.T_HEARTBEAT_CONFIRMED, cs.T_SYNC})
 REFUSALS = ("BAD_PROOF", "NOT_PERMITTED")
@@ -107,7 +102,7 @@ REFUSALS = ("BAD_PROOF", "NOT_PERMITTED")
 
 def error_name(code: int) -> str:
     """The 09 section 12.6 name of an error code."""
-    return csf.MB_ERRORS[code] if code < len(csf.MB_ERRORS) else str(code)
+    return cs.MB_ERRORS[code] if code < len(cs.MB_ERRORS) else str(code)
 
 
 def server_key(url: str) -> str:
@@ -295,7 +290,7 @@ class MailboxLink:
                 self.url,
                 protocols=(SUBPROTOCOL,),
                 ssl=(context or True) if self.secure else False,
-                max_msg_size=csf.MB_MAX_MESSAGE,
+                max_msg_size=cs.MB_MAX_MESSAGE,
                 autoping=True,
                 heartbeat=None,
                 compress=0,
@@ -303,27 +298,27 @@ class MailboxLink:
             if self.ws.protocol != SUBPROTOCOL:
                 raise ConnectionError("the server did not accept the cs-mailbox.1 subprotocol")
             nonce_c = secrets.token_bytes(16)
-            await self.ws.send_bytes(csf.cbor([csf.MB_HELLO, csf.MB_VERSION, nonce_c]))
-            g = csf.mb_decode(await self._recv_bytes())
-            if g[0] == csf.MB_ERROR:
+            await self.ws.send_bytes(cs.cbor([cs.MB_HELLO, cs.MB_VERSION, nonce_c]))
+            g = cs.mb_decode(await self._recv_bytes())
+            if g[0] == cs.MB_ERROR:
                 raise MailboxRefused(error_name(g[2]))
-            if g[0] != csf.MB_GREETING:
+            if g[0] != cs.MB_GREETING:
                 raise ConnectionError("expected a greeting")
             _, version, server_pub, server_id, generation, nonce_s, sig = g
-            msg = csf.greeting_msg(self.host, nonce_c, nonce_s, generation)
+            msg = cs.greeting_msg(self.host, nonce_c, nonce_s, generation)
             if (
-                version != csf.MB_VERSION
-                or server_id != csf.server_id_of(server_pub)
+                version != cs.MB_VERSION
+                or server_id != cs.server_id_of(server_pub)
                 or await verify(server_pub, msg, sig)
             ):
                 raise ConnectionError("the greeting failed its checks")
             self.server_id, self.generation, self.nonce_s = server_id, generation, nonce_s
-            sig = csf.ed_sign(self._seed, csf.auth_msg(server_id, nonce_c, nonce_s, self.pub))
-            await self.ws.send_bytes(csf.cbor([csf.MB_AUTH, self.pub, sig]))
-            w = csf.mb_decode(await self._recv_bytes())
-            if w[0] == csf.MB_ERROR:
+            sig = cs.ed_sign(self._seed, cs.auth_msg(server_id, nonce_c, nonce_s, self.pub))
+            await self.ws.send_bytes(cs.cbor([cs.MB_AUTH, self.pub, sig]))
+            w = cs.mb_decode(await self._recv_bytes())
+            if w[0] == cs.MB_ERROR:
                 raise MailboxRefused(error_name(w[2]))
-            if w[0] != csf.MB_WELCOME:
+            if w[0] != cs.MB_WELCOME:
                 raise ConnectionError("expected welcome")
             self.pseudonym = w[1]
             self.seq = 0
@@ -344,7 +339,7 @@ class MailboxLink:
         assert self.ws is not None
         self.seq += 1
         await self.ws.send_bytes(
-            csf.signed(self._seed, self.server_id, self.nonce_s, [m[0], self.seq, *m[1:]])
+            cs.signed(self._seed, self.server_id, self.nonce_s, [m[0], self.seq, *m[1:]])
         )
         return self.seq
 
@@ -354,7 +349,7 @@ class MailboxLink:
         # An unanswered ping is forgotten after a minute.
         self._pings = {seq: at for seq, at in self._pings.items() if now - at < 60_000}
         self._pings[self.seq + 1] = now
-        await self.send([csf.MB_PING])
+        await self.send([cs.MB_PING])
 
     async def recv(self) -> list[Any]:
         """The next server message other than ping_s and pong_s, which are handled
@@ -362,18 +357,18 @@ class MailboxLink:
         while True:
             data = await self._recv_bytes()
             try:
-                m = csf.mb_decode(data)
+                m = cs.mb_decode(data)
             except ValueError:
                 try:
-                    v = csf.uncbor(data)
+                    v = cs.uncbor(data)
                 except ValueError:
                     v = None
-                if isinstance(v, list) and v and type(v[0]) is int and v[0] not in csf.MB_SCHEMA:
+                if isinstance(v, list) and v and type(v[0]) is int and v[0] not in cs.MB_SCHEMA:
                     continue
                 raise ConnectionError("a malformed message") from None
-            if m[0] == csf.MB_PING_S:
-                await self.send([csf.MB_PONG, m[1]])
-            elif m[0] == csf.MB_PONG_S:
+            if m[0] == cs.MB_PING_S:
+                await self.send([cs.MB_PONG, m[1]])
+            elif m[0] == cs.MB_PONG_S:
                 sent = self._pings.pop(m[1], None)
                 if sent is not None:
                     self.rtt_ms = max(0, self._clock() - sent)
@@ -564,7 +559,7 @@ class Federation:
 
     async def _verify(self, pub: bytes, msg: bytes, sig: bytes) -> str | None:
         """Strict Ed25519 (09 section 5.2); pure Python, so off the event loop."""
-        return await self.hass.async_add_executor_job(csf.ed_verify_error, pub, msg, sig)
+        return await self.hass.async_add_executor_job(cs.ed_verify_error, pub, msg, sig)
 
     async def _keep(self, s: MailboxServer) -> None:
         """Stay connected, reconnecting with backoff."""
@@ -734,7 +729,7 @@ class Federation:
                 seed, tag = self._tag(k_dev_tag, index)
                 # No later than the end of epoch x + 1 (09 section 5.3).
                 out[tag] = (seed, cs.EPOCH_SECONDS * (x + 2), eui, fp)
-            first, last = csf.sync_window(max(last_fcnt, 1), silence, heartbeat)
+            first, last = cs.sync_window(max(last_fcnt, 1), silence, heartbeat)
             for n in range(first, last + 1):
                 index = cs.block_index(n * cs.TAG_BLOCK + 1)
                 used.add((k_dev_tag, index))
@@ -762,7 +757,7 @@ class Federation:
         ]
         if stale:  # a removed or re-paired device (09 section 5.3)
             for i in range(0, len(stale), WITHDRAW_CHUNK):
-                await link.send([csf.MB_WITHDRAW, stale[i : i + WITHDRAW_CHUNK]])
+                await link.send([cs.MB_WITHDRAW, stale[i : i + WITHDRAW_CHUNK]])
             for t in stale:
                 s.registered.pop(t, None)
             _LOGGER.debug("Mailbox %s: withdrew %s tags", s.url, len(stale))
@@ -775,9 +770,9 @@ class Federation:
         for i in range(0, len(todo), REGISTER_CHUNK):
             chunk = todo[i : i + REGISTER_CHUNK]
             entries = [
-                csf.reg_entry(want[t][0], link.server_id, link.pub, want[t][1]) for t in chunk
+                cs.reg_entry(want[t][0], link.server_id, link.pub, want[t][1]) for t in chunk
             ]
-            seq = await link.send([csf.MB_REGISTER, entries])
+            seq = await link.send([cs.MB_REGISTER, entries])
             s.pending[seq] = ("register", chunk)
             for t in chunk:
                 _, exp, eui, fp = want[t]
@@ -791,16 +786,16 @@ class Federation:
 
     async def _on_message(self, s: MailboxServer, m: list[Any]) -> None:
         kind = m[0]
-        if kind == csf.MB_REGISTERED:
+        if kind == cs.MB_REGISTERED:
             self._on_registered(s, m[1], m[2])
-        elif kind == csf.MB_DELIVER:
+        elif kind == cs.MB_DELIVER:
             if self.owner:
                 self._on_deliver(s, m)
-        elif kind == csf.MB_FORWARD:
+        elif kind == cs.MB_FORWARD:
             await self._on_forward(s, m[1], m[2], m[3])
-        elif kind == csf.MB_RESULT_S:
+        elif kind == cs.MB_RESULT_S:
             await self._on_result(s, m[1], m[2], m[3])
-        elif kind == csf.MB_ERROR:
+        elif kind == cs.MB_ERROR:
             await self._on_error(s, m[1], error_name(m[2]))
         # Other types (handshake messages after welcome) are ignored.
 
@@ -889,10 +884,10 @@ class Federation:
         ok = [
             r
             for r in req.tx.fed
-            if r.flags & csf.RXF_DOWNLINK
+            if r.flags & cs.RXF_DOWNLINK
             and r.server.up
             and (r.server.key, r.rx_ref) not in req.tried
-            and csf.federated_request_ok(r.age_ms, r.rtt_pub, r.server.rtt_ms, now - r.arrived_ms)
+            and cs.federated_request_ok(r.age_ms, r.rtt_pub, r.server.rtt_ms, now - r.arrived_ms)
         ]
         floor = self._floor_snr()
         last = self._last_publisher.get(req.tx.device.eui)
@@ -929,7 +924,7 @@ class Federation:
         req.sent_ms = self.server.clock()
         self._last_publisher[req.tx.device.eui] = r.path
         try:
-            req.seq = await link.send([csf.MB_REQUEST, r.rx_ref, req.downlink])
+            req.seq = await link.send([cs.MB_REQUEST, r.rx_ref, req.downlink])
         except ConnectionError, aiohttp.ClientError, RuntimeError:
             return await self._choose(req)
         r.server.pending[req.seq] = ("request", req)
@@ -957,7 +952,7 @@ class Federation:
             if self._requests.get(tx_id) is req and req.current is r:
                 self._requests.pop(tx_id, None)
 
-        self._later((csf.FORWARD_TIMEOUT_MS + rtt) / 1000, expire)
+        self._later((cs.FORWARD_TIMEOUT_MS + rtt) / 1000, expire)
         if req.soft_timer is not None:
             req.soft_timer.cancel()
         req.soft_timer = self._later(SOFT_FAILURE_S, lambda: self._soft_timeout(req, r))
@@ -1068,7 +1063,7 @@ class Federation:
         The caller has checked the proxy's radio profile."""
         if not self.publish or header.ftype == cs.T_JOIN or cs.is_downlink(header.ftype):
             return
-        key = csf.frame_key(frame)
+        key = cs.frame_key(frame)
         now = heard.at_ms
         txn = self._collecting.get(key)
         if txn is not None and now - txn.first_ms <= cs.MERGE_WINDOW_MS:
@@ -1109,15 +1104,15 @@ class Federation:
             if len(s.published) >= PUBLISH_PER_SECOND:
                 continue  # the newest beyond 5 a second is dropped
             s.published.append(now)
-            s.issued = {r: v for r, v in s.issued.items() if now - v.at_ms < csf.RX_REF_MS}
+            s.issued = {r: v for r, v in s.issued.items() if now - v.at_ms < cs.RX_REF_MS}
             receptions = []
             for r in heard:
                 rx_ref = secrets.token_bytes(8)  # fresh per reception and server (6.2)
                 dl = self.downlinks and txn.ftype in CONFIRMED and self._candidate(r)
                 # Remembered 5 s from the reception (09 section 6.2).
                 s.issued[rx_ref] = Issued(r, txn, dl, r.at_ms)
-                flags = (csf.RXF_TS_UNCERTAIN if r.flags & cs.UPF_TS_UNCERTAIN else 0) | (
-                    csf.RXF_DOWNLINK if dl else 0
+                flags = (cs.RXF_TS_UNCERTAIN if r.flags & cs.UPF_TS_UNCERTAIN else 0) | (
+                    cs.RXF_DOWNLINK if dl else 0
                 )
                 receptions.append(
                     [
@@ -1129,7 +1124,7 @@ class Federation:
                     ]
                 )
             try:
-                await s.link.send([csf.MB_PUBLISH, txn.frame, receptions])
+                await s.link.send([cs.MB_PUBLISH, txn.frame, receptions])
             except ConnectionError, aiohttp.ClientError, RuntimeError:
                 continue
             s.publishes += 1
@@ -1144,7 +1139,7 @@ class Federation:
         now = self.server.clock()
         iss = s.issued.get(rx_ref)
         code, why, airtime = "", "", 0.0
-        if iss is None or now - iss.at_ms > csf.RX_REF_MS or iss.used:
+        if iss is None or now - iss.at_ms > cs.RX_REF_MS or iss.used:
             code, why = "invalid", "rx_ref unknown, expired or used"
         elif not iss.downlink or not self.downlinks or not self._candidate(iss.heard):
             code, why = "not_capable", "no DOWNLINK on that reception"
@@ -1227,7 +1222,7 @@ class Federation:
     async def _result(self, s: MailboxServer, rx_ref: bytes, code: int, offset_us: int) -> None:
         if s.up and s.link is not None:
             try:
-                await s.link.send([csf.MB_RESULT, rx_ref, code, offset_us])
+                await s.link.send([cs.MB_RESULT, rx_ref, code, offset_us])
             except (ConnectionError, aiohttp.ClientError, RuntimeError) as err:
                 _LOGGER.debug("Mailbox %s: result not sent: %s", s.url, err)
 
