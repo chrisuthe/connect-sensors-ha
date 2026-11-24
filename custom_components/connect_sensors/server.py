@@ -228,6 +228,8 @@ class Transmission:
     carries: bool = False
     # Epochs between the matched tag's and ours, if that is skew (07 section 4, step 7).
     skew: int = 0
+    # The answer corrects the sensor's clock: the limit counts from when it goes out.
+    corrects: bool = False
 
 
 class Proxy:
@@ -363,7 +365,7 @@ class Device:
         self.expired_join_logged = False
         # The last clock skew found (07 section 4, step 7): epochs off, and when.
         self.clock_skew: dict[str, Any] | None = None
-        # When an otherwise unanswered uplink last got a clock correction.
+        # When a clock correction last went out (07 section 5, limited per device).
         self.corrected_ms: int | None = None
         self.correction_limited = False
         # Paired before connectsensors 0.4.0: the sensor lost that pairing when its
@@ -1887,7 +1889,7 @@ class NetworkServer(asyncio.DatagramProtocol):
                         CORRECTION_INTERVAL_S // 60,
                     )
                 return False
-        device.corrected_ms = now_ms
+        tx.corrects = True
         device.correction_limited = False
         if tx.skew:
             _LOGGER.info(
@@ -2070,6 +2072,7 @@ class NetworkServer(asyncio.DatagramProtocol):
             first = _best(rx1)
             result = await self._transmit(tx, first, RX1_OFFSET_US, downlink, airtime, wait=True)
             if result == "sent":
+                self._corrected(tx)
                 return
             # The next best candidate, or the same proxy if it is the only one (6.3).
             candidates = self._candidates(tx, airtime)
@@ -2104,6 +2107,13 @@ class NetworkServer(asyncio.DatagramProtocol):
             )
             return
         await self._transmit(tx, _best(candidates), RX2_OFFSET_US, downlink, airtime, wait=False)
+        self._corrected(tx)
+
+    @staticmethod
+    def _corrected(tx: Transmission) -> None:
+        """A correction went out. One that did not waits for the next uplink (07 6.3)."""
+        if tx.corrects:
+            tx.device.corrected_ms = _now_ms()
 
     async def _transmit(
         self,

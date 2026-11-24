@@ -135,3 +135,25 @@ async def test_late_arrival_is_not_corrected(
 
     sensor.clock_offset = right - EPOCH
     await uplink_answered(hass, proxy, sensor)
+
+
+async def test_failed_correction_is_retried(
+    hass: HomeAssistant,
+    loaded: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    unix: Unix,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A correction whose RX1 transmission failed does not count toward the limit: the
+    next uplink gets one (07 section 6.3)."""
+    right = await paired_at(hass, proxy, sensor, unix, EPOCH // 2)
+    sensor.clock_offset = right - EPOCH
+    proxy.tx_result = (1, 0)  # TOO_LATE
+    proxy.uplink(sensor.uplink(cs.T_HEARTBEAT, full_state(0)))
+    await proxy.recv(cs.M_DOWNLINK)
+    await proxy.nothing()  # an unconfirmed uplink gets no RX2
+
+    proxy.tx_result = (0, 1800)
+    await uplink_answered(hass, proxy, sensor)
+    assert LIMITED not in caplog.text

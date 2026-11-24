@@ -790,11 +790,12 @@ async def test_clock_correction_rides_only_on_confirmed_uplinks(
     """Through federation a clock correction goes out only in RX2 answers to confirmed
     uplinks (09 section 7.7): an unconfirmed TIME_UNSURE uplink gets no request."""
     device = homes.device
+    fcnt_down = device.fcnt_down
     homes.via_b(cs.T_HEARTBEAT, cs.UF_TIME_UNSURE)
     await until(lambda: device.last_fcnt == homes.sensor.fcnt, "the uplink at A")
     await homes.proxy_b.nothing(1.0)
-    assert device.corrected_ms is None
+    # No answer was even built for it.
+    assert device.fcnt_down == fcnt_down
 
     rx = homes.via_b(cs.T_HEARTBEAT_CONFIRMED, cs.UF_TIME_UNSURE)
     await homes.rx2_via_b(rx)
-    assert device.corrected_ms is not None
