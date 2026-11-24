@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.3
+
+- Require **connectsensors 0.4.3**. A proxy's messages that arrive slightly out of
+  order (up to 15 below the newest) are now accepted once instead of dropped, and
+  messages from before a proxy restart can't be replayed into its new session (spec 05
+  section 3.2). No configuration change.
+
 ## 0.2.2
 
 - **Pairing deadline** (spec 04 section 4.2): a device must be paired within 10 minutes
