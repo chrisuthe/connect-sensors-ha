@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 import time
 from typing import Any
 
@@ -28,7 +29,7 @@ from custom_components.connect_sensors.const import (
 from custom_components.connect_sensors.server import NetworkServer
 
 from .common import answer, full_state
-from .conftest import DEV_EUI, K_ROOT, PROXY_KEY, state_of
+from .conftest import DEV_EUI, K_ROOT, PROXY_KEY, WallClock, state_of
 from .sim import SimProxy, SimSensor
 
 PAIRING = "sensor.front_door_pairing"
@@ -294,5 +295,43 @@ async def test_migration_from_0_3(
     assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
     assert device.to_store()["re_pair"] is False
 
+    result = await manager.async_configure(result["flow_id"], {})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_re_pair_repair_rearms(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    proxy: SimProxy,
+    sensor: SimSensor,
+    hass_storage: dict[str, Any],
+    wall: WallClock,
+) -> None:
+    """A device stored before pairing deadlines existed starts armed, so an upgrade does
+    not leave it expired; once it has expired, opening the re-pair repair arms it again
+    (04 section 4.2)."""
+    store(hass_storage, milestone_2(state="scanned", re_pair=True, readings={}), root_counter=3)
+    server = await start(hass, entry)
+    device = server.devices[DEV_EUI]
+    assert device.pairing_deadline is not None and not device.expired
+    assert state_of(hass, PAIRING).state == "scanned"
+
+    await wall.advance(timedelta(minutes=10, seconds=5))
+    assert state_of(hass, PAIRING).state == "expired"
+
+    assert await async_setup_component(hass, "repairs", {})
+    manager = repairs_flow_manager(hass)
+    assert manager is not None
+    result = await manager.async_init(DOMAIN, context={"issue_id": f"re_pair_{DEV_EUI}"})
+    assert result["type"] is FlowResultType.FORM
+    assert state_of(hass, PAIRING).state == "scanned"
+
+    await proxy.connect()
+    rx = proxy.uplink(sensor.join())
+    assert sensor.key_exchange(await answer(proxy, rx)) == "accept"
+    rx = proxy.uplink(sensor.uplink(cs.T_HEARTBEAT_CONFIRMED, full_state(1), cs.UF_DL_ACK))
+    sensor.downlink(await answer(proxy, rx))
+    await hass.async_block_till_done()
+    assert state_of(hass, PAIRING).state == "paired"
     result = await manager.async_configure(result["flow_id"], {})
     assert result["type"] is FlowResultType.CREATE_ENTRY

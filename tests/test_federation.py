@@ -782,3 +782,19 @@ async def test_non_sent_result_releases_and_counts(hass: HomeAssistant, homes: H
     assert record.failures[0][1] == 0.5
     assert not record.credits
     await homes.proxy_b.nothing(1.0)
+
+
+async def test_clock_correction_rides_only_on_confirmed_uplinks(
+    hass: HomeAssistant, homes: Homes
+) -> None:
+    """Through federation a clock correction goes out only in RX2 answers to confirmed
+    uplinks (09 section 7.7): an unconfirmed TIME_UNSURE uplink gets no request."""
+    device = homes.device
+    homes.via_b(cs.T_HEARTBEAT, cs.UF_TIME_UNSURE)
+    await until(lambda: device.last_fcnt == homes.sensor.fcnt, "the uplink at A")
+    await homes.proxy_b.nothing(1.0)
+    assert device.corrected_ms is None
+
+    rx = homes.via_b(cs.T_HEARTBEAT_CONFIRMED, cs.UF_TIME_UNSURE)
+    await homes.rx2_via_b(rx)
+    assert device.corrected_ms is not None

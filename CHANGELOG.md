@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **Pairing deadline** (spec 04 section 4.2): a device must be paired within 10 minutes
+  of entering its code. After that its *Pairing* entity shows *Expired*, its root key
+  is no longer tried, and a button press is logged once and ignored. The new *Start
+  pairing* button, and opening the re-pair repair, give another 10 minutes. Devices
+  added before this version start with a fresh 10 minutes.
+- **Clock correction** (spec 07 sections 4 and 5): a sensor whose tag belongs to the
+  previous or next hour, more than 5 minutes from an hour boundary, has a wrong clock.
+  Like a `TIME_UNSURE` uplink, its unconfirmed uplinks are answered in RX1 to correct
+  it, at most every 10 minutes; through federation only confirmed uplinks are. The
+  last skew found is in the device's diagnostics (`clock_skew`).
+
 ## 0.2.1
 
 - Require **connectsensors 0.4.2**, and take the federation (spec 09) helpers from its

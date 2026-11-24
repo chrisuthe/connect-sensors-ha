@@ -24,6 +24,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ConnectSensorsConfigEntry
 from .const import (
+    PAIRING_EXPIRED,
     STATE_EXCHANGED,
     STATE_PAIRED,
     STATE_SCANNED,
@@ -54,7 +55,16 @@ class ProxySensorDescription(SensorEntityDescription):
 
 
 def _pairing(device: Device) -> str:
-    return "stalled" if device.stalled and device.state != STATE_PAIRED else device.state
+    if device.state == STATE_PAIRED:
+        return STATE_PAIRED
+    if device.expired:
+        return PAIRING_EXPIRED
+    return "stalled" if device.stalled else device.state
+
+
+def _pairing_attributes(device: Device) -> dict[str, Any]:
+    deadline = device.pairing_deadline
+    return {"deadline": deadline.isoformat() if deadline and device.state != STATE_PAIRED else None}
 
 
 def _command(device: Device) -> str | None:
@@ -78,9 +88,10 @@ DEVICE_SENSORS: tuple[DeviceSensorDescription, ...] = (
         key="pairing",
         translation_key="pairing",
         device_class=SensorDeviceClass.ENUM,
-        options=[STATE_SCANNED, STATE_EXCHANGED, STATE_PAIRED, "stalled"],
+        options=[STATE_SCANNED, STATE_EXCHANGED, STATE_PAIRED, "stalled", PAIRING_EXPIRED],
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=_pairing,
+        attributes_fn=_pairing_attributes,
     ),
     DeviceSensorDescription(
         key="last_seen",

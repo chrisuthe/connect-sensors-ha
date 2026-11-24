@@ -65,7 +65,7 @@
             "name": "Optional. Defaults to the model and the end of the device ID.",
             "pairing_code": "The CS:1:... code inside the battery compartment or on the insert."
           },
-          "description": "After adding the device, press its button. It pairs through any of your proxies within range.\n\nA second-hand device must be factory reset first: hold its button for 10 seconds."
+          "description": "After adding the device, press its button within 10 minutes. It pairs through any of your proxies within range. If the 10 minutes pass, press the device's *Start pairing* button in Home Assistant first.\n\nA second-hand device must be factory reset first: hold its button for 10 seconds."
         }
       }
     },
@@ -159,7 +159,13 @@
           "exchanged": "Exchanging keys",
           "paired": "Paired",
           "scanned": "Waiting for button press",
-          "stalled": "Stalled"
+          "stalled": "Stalled",
+          "expired": "Expired"
+        },
+        "state_attributes": {
+          "deadline": {
+            "name": "Deadline"
+          }
         }
       },
       "percent": {
@@ -200,6 +206,11 @@
           }
         }
       }
+    },
+    "button": {
+      "start_pairing": {
+        "name": "Start pairing"
+      }
     }
   },
   "exceptions": {
@@ -220,6 +231,9 @@
     },
     "value_out_of_range": {
       "message": "The value does not fit a {kind} reading."
+    },
+    "already_paired": {
+      "message": "{name} is already paired. To pair it again, remove it and add it with its pairing code."
     }
   },
   "issues": {
@@ -241,7 +255,7 @@
         "step": {
           "confirm": {
             "title": "Re-pair {name}",
-            "description": "This version of the integration uses new frame tags and a new pairing procedure. {name} lost its pairing when its firmware was updated for them, so Home Assistant no longer hears it, and its readings show as unavailable.\n\nPress the device's button once, near one of your proxies. When the device's *Pairing* sensor shows *Paired*, submit this form.\n\nIf pairing does not finish, hold the button for 10 seconds to factory-reset the device, then press it again."
+            "description": "This version of the integration uses new frame tags and a new pairing procedure. {name} lost its pairing when its firmware was updated for them, so Home Assistant no longer hears it, and its readings show as unavailable.\n\nPress the device's button once, near one of your proxies, within 10 minutes of opening this repair. When the device's *Pairing* sensor shows *Paired*, submit this form.\n\nIf pairing does not finish, hold the button for 10 seconds to factory-reset the device, then press it again."
           }
         },
         "error": {

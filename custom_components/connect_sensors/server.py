@@ -46,6 +46,7 @@ from .const import (
     CONF_KEY,
     CONF_PROFILE,
     CONF_REGION,
+    CORRECTION_INTERVAL_S,
     DOMAIN,
     DUTY_CYCLE_BACKOFF_S,
     EVENT_DEVICE_REACHABLE,
@@ -53,6 +54,7 @@ from .const import (
     EVENT_READING,
     EXCHANGED_TIMEOUT_S,
     LEAVE_EXPIRY_H,
+    PAIRING_DEADLINE_S,
     PROXY_TIMEOUT_S,
     REGIONS,
     RESERVE_BLOCK,
@@ -64,6 +66,7 @@ from .const import (
     SAVE_DELAY_S,
     SINGLE_PATH_REPAIR_H,
     SINGLE_PATH_WINDOW_H,
+    SKEW_MARGIN_S,
     SNR_TIE_DB,
     STATE_EXCHANGED,
     STATE_PAIRED,
@@ -111,6 +114,7 @@ PROXY_ISSUES = ("proxy_mismatch", "shared_key")
 COMMAND_EXPIRY = timedelta(hours=COMMAND_EXPIRY_H)
 LEAVE_EXPIRY = timedelta(hours=LEAVE_EXPIRY_H)
 EXCHANGED_TIMEOUT = timedelta(seconds=EXCHANGED_TIMEOUT_S)
+PAIRING_DEADLINE = timedelta(seconds=PAIRING_DEADLINE_S)
 
 
 def _now_ms() -> int:
@@ -222,6 +226,8 @@ class Transmission:
     commands: list[Command] = field(default_factory=list)
     # The answer carries a command, or NOP (09 section 9).
     carries: bool = False
+    # Epochs between the matched tag's and ours, if that is skew (07 section 4, step 7).
+    skew: int = 0
 
 
 class Proxy:
@@ -349,6 +355,17 @@ class Device:
         self.stalled = False
         # When the device last entered EXCHANGED, for its 2-minute timeout (04 4.2).
         self.exchanged_at: datetime | None = None
+        # SCANNED ends here (04 section 4.2); an EXCHANGED timeout keeps it. Once past
+        # it, the device is expired until the user starts pairing again.
+        self.pairing_deadline: datetime | None = _utcnow() + PAIRING_DEADLINE
+        self.expired = False
+        # A JOIN from an expired device is recognized and logged once per expiry.
+        self.expired_join_logged = False
+        # The last clock skew found (07 section 4, step 7): epochs off, and when.
+        self.clock_skew: dict[str, Any] | None = None
+        # When an otherwise unanswered uplink last got a clock correction.
+        self.corrected_ms: int | None = None
+        self.correction_limited = False
         # Paired before connectsensors 0.4.0: the sensor lost that pairing when its
         # firmware was upgraded, and has to be paired again.
         self.re_pair = False
@@ -452,6 +469,14 @@ class Device:
         """A reading is shown unless the device is unreachable or has not resent it."""
         return not self.unreachable and key not in self.stale
 
+    def pairing_open(self, now: datetime) -> bool:
+        """A JOIN may be answered: not paired, and before the pairing deadline."""
+        return (
+            self.state != STATE_PAIRED
+            and not self.expired
+            and (self.pairing_deadline is None or now < self.pairing_deadline)
+        )
+
     def set_session(self, k_session: bytes) -> None:
         """Start using a new k_session; its downlink counter starts at 1 (02 section 8.4)."""
         self.k_session = k_session
@@ -478,6 +503,11 @@ class Device:
             "pending": pending.to_dict() if pending is not None else None,
             "stalled": self.stalled,
             "exchanged_at": self.exchanged_at.isoformat() if self.exchanged_at else None,
+            "pairing_deadline": self.pairing_deadline.isoformat()
+            if self.pairing_deadline
+            else None,
+            "expired": self.expired,
+            "clock_skew": self.clock_skew,
             "re_pair": self.re_pair,
             "readings": self.readings,
             "sw_version": self.sw_version,
@@ -521,6 +551,13 @@ class Device:
         )
         self.stalled = d["stalled"]
         self.exchanged_at = _parse_time(d.get("exchanged_at"))
+        if "pairing_deadline" in d:
+            self.pairing_deadline = _parse_time(d["pairing_deadline"])
+        elif self.state == STATE_PAIRED:
+            self.pairing_deadline = None
+        # else stored before the deadline existed: armed from now, so it is not expired.
+        self.expired = d.get("expired", False)
+        self.clock_skew = d.get("clock_skew")
         self.re_pair = d.get("re_pair", False)
         self.readings = d["readings"]
         self.sw_version = d["sw_version"]
@@ -625,6 +662,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         self._tag_time: int = 0
         # The tag block of each device's last_fcnt in the table (07 section 3).
         self._tag_blocks: dict[str, bytes] = {}
+        # The epoch of each device's normal tags in the table, by tag (07 section 4.7).
+        self._tag_epochs: dict[str, dict[bytes, int]] = {}
         self._collecting: dict[bytes, Transmission] = {}
         # Confirmed transmissions none of our proxies could answer, with their answer:
         # a neighbour's copy may still arrive in time for RX2 (07 section 4.4).
@@ -886,6 +925,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         now = _unix()
         self._tags = cs.TagTable()
         self._tag_blocks.clear()
+        self._tag_epochs.clear()
         self._tag_epoch = cs.epoch_of(now)
         self._tag_time = now
         for _, device in self._all_devices():
@@ -897,6 +937,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         if device.session_keys is None or device.state not in (STATE_EXCHANGED, STATE_PAIRED):
             self._tags.remove(device.eui)
             self._tag_blocks.pop(device.eui, None)
+            self._tag_epochs.pop(device.eui, None)
             if self.federation is not None:
                 self.federation.devices_changed()
             return
@@ -905,8 +946,24 @@ class NetworkServer(asyncio.DatagramProtocol):
             device.eui, device.session_keys.k_dev_tag, self._tag_epoch, device.last_fcnt
         )
         self._tag_blocks[device.eui] = _tag_block(device.last_fcnt)
+        self._tag_epochs[device.eui] = {
+            t: int.from_bytes(index[1:], "big")
+            for kind, index, t in self._tags.by_device.get(device.eui, [])
+            if kind == "normal"
+        }
         if self.federation is not None:
             self.federation.devices_changed()
+
+    def _skew(self, device: Device, tag: bytes) -> int:
+        """Epochs between the frame's normal tag and the current one, if that is clock
+        skew: a neighbouring epoch, more than 5 minutes from a boundary (07 4.7)."""
+        epoch = self._tag_epochs.get(device.eui, {}).get(tag)
+        if epoch is None or self._tag_epoch is None or epoch == self._tag_epoch:
+            return 0
+        into = _unix() % cs.EPOCH_SECONDS
+        if min(into, cs.EPOCH_SECONDS - into) <= SKEW_MARGIN_S:
+            return 0
+        return epoch - self._tag_epoch
 
     @callback
     def _tick(self, _now: datetime) -> None:
@@ -940,6 +997,15 @@ class NetworkServer(asyncio.DatagramProtocol):
             ):
                 self._exchange_timed_out(device)
                 self._save_soon()  # a state change (07 section 10)
+                changed = True
+            if (
+                device.state == STATE_SCANNED
+                and not device.expired
+                and device.pairing_deadline is not None
+                and now >= device.pairing_deadline
+            ):
+                self._pairing_expired(device)
+                self._save_soon()
                 changed = True
             for sid in [s for s, t in device.heard_by.items() if now - t >= SINGLE_PATH_WINDOW]:
                 del device.heard_by[sid]
@@ -983,6 +1049,31 @@ class NetworkServer(asyncio.DatagramProtocol):
         device.clear_session()
         self._update_tags(device)
         _LOGGER.info("%s: pairing timed out; press its button again", device.name)
+
+    @callback
+    def _pairing_expired(self, device: Device) -> None:
+        """10 minutes in SCANNED (04 section 4.2). The device is kept, but its root key
+        is no longer tried and its pending exchange is discarded; the root counter stays
+        (02 section 8.4)."""
+        device.expired = True
+        device.expired_join_logged = False
+        device.join.pending = None
+        self._clear_stall(device)
+        _LOGGER.info("%s: pairing expired; use Start pairing to try again", device.name)
+
+    @callback
+    def async_start_pairing(self, device: Device) -> bool:
+        """Give the user another 10 minutes to press the device's button. False if the
+        device is paired: re-pairing it is a new pairing code (04 section 4.4)."""
+        if device.state == STATE_PAIRED:
+            return False
+        device.pairing_deadline = _utcnow() + PAIRING_DEADLINE
+        device.expired = False
+        device.expired_join_logged = False
+        _LOGGER.info("%s: pairing started; press its button within 10 minutes", device.name)
+        self._save_soon()
+        async_dispatcher_send(self.hass, signal_device_update(device.eui))
+        return True
 
     @callback
     def _device_issues(self, device: Device, now: datetime) -> None:
@@ -1472,6 +1563,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         tx = Transmission(
             frame, h, device, keys, plaintext, got["counter"], got["answer"], now_ms, [reception]
         )
+        tx.skew = self._skew(device, h.tag)
         self._start(tx)
 
     def _start(self, tx: Transmission) -> None:
@@ -1532,6 +1624,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         tx = Transmission(
             frame, h, device, keys, plaintext, got["counter"], got["answer"], arrived_ms, [], fed
         )
+        tx.skew = self._skew(device, h.tag)
         self._start(tx)
 
     async def _request_late(self, tx: Transmission, downlink: bytes) -> None:
@@ -1579,8 +1672,33 @@ class NetworkServer(asyncio.DatagramProtocol):
                     _LOGGER.debug("%s: frame %s found by trial decryption", device.name, h.fcnt)
                     self._identified[frame] = (device, now_ms)
                     return opened
+            if h.ftype == cs.T_JOIN and self._expired_join(frame):
+                return None
         self.foreign_frames += 1
         return None
+
+    def _expired_join(self, frame: bytes) -> bool:
+        """A JOIN from a device whose pairing expired: logged, then ignored. Each expiry
+        tries the root key until it is seen once, so the user learns why nothing
+        happens; after that the key is not tried at all."""
+        now = _utcnow()
+        for device in self.devices.values():
+            if device.state == STATE_PAIRED or device.pairing_open(now):
+                continue
+            if device.expired_join_logged:
+                continue
+            try:
+                cs.open_frame(device.root_keys, frame)
+            except Exception:  # InvalidTag or ValueError: not this device
+                continue
+            device.expired_join_logged = True
+            _LOGGER.warning(
+                "%s: button pressed after its pairing expired; ignored. Use its Start "
+                "pairing button, then press the device's button again",
+                device.name,
+            )
+            return True
+        return False
 
     def _bootstrap_allowed(self, now_ms: int) -> bool:
         """At most 50 bootstrap frames a minute are trial-decrypted (02 section 11.3)."""
@@ -1600,7 +1718,7 @@ class NetworkServer(asyncio.DatagramProtocol):
         JOIN while waiting to be paired, else the session keys while EXCHANGED or
         PAIRED (02 section 11.3)."""
         if ftype == cs.T_JOIN:
-            return device.root_keys if device.state in (STATE_SCANNED, STATE_EXCHANGED) else None
+            return device.root_keys if device.pairing_open(_utcnow()) else None
         if device.state in (STATE_EXCHANGED, STATE_PAIRED):
             return device.session_keys
         return None
@@ -1667,6 +1785,7 @@ class NetworkServer(asyncio.DatagramProtocol):
             device.state = STATE_PAIRED
             device.join.paired()
             device.exchanged_at = None
+            device.pairing_deadline = None
             device.re_pair = False
             self._clear_stall(device)
             self._set_issue("re_pair", device.eui, None)
@@ -1699,7 +1818,8 @@ class NetworkServer(asyncio.DatagramProtocol):
         if queued and device.commands and latest and (fresh or tx.answer):
             commands, taken, more = self._take_commands(device)
             dflags = cs.DF_PENDING if more else 0
-        if not (tx.answer or taken or (fresh and uflags & cs.UF_TIME_UNSURE)):
+        correct = fresh and self._correct_clock(tx, uflags)
+        if not (tx.answer or taken or correct):
             return None
         if (
             not commands
@@ -1736,6 +1856,46 @@ class NetworkServer(asyncio.DatagramProtocol):
             fcnt,
             cs.downlink_payload(h.fcnt, _unix(), dflags, commands),
         )
+
+    def _correct_clock(self, tx: Transmission, uflags: int) -> bool:
+        """Whether a fresh uplink needs an answer for its clock: TIME_UNSURE, or skew
+        (07 section 5). A confirmed uplink is answered anyway, and every answer carries
+        server_time. An unconfirmed one is answered only in RX1 by our own proxies,
+        never through federation (09 section 7.7), and at most every 10 minutes."""
+        device = tx.device
+        if tx.skew:
+            device.clock_skew = {"epochs": tx.skew, "at": _utcnow().isoformat()}
+        if not (tx.skew or uflags & cs.UF_TIME_UNSURE):
+            return False
+        now_ms = _now_ms()
+        if not tx.answer:
+            if not tx.receptions:
+                return False
+            if (
+                device.corrected_ms is not None
+                and now_ms - device.corrected_ms < CORRECTION_INTERVAL_S * 1000
+            ):
+                if not device.correction_limited:
+                    device.correction_limited = True
+                    _LOGGER.warning(
+                        "%s: clock still wrong after a correction; correcting it at most "
+                        "every %s minutes",
+                        device.name,
+                        CORRECTION_INTERVAL_S // 60,
+                    )
+                return False
+        device.corrected_ms = now_ms
+        device.correction_limited = False
+        if tx.skew:
+            _LOGGER.info(
+                "%s: clock off by %+d hour (frame %s); correcting it",
+                device.name,
+                tx.skew,
+                tx.header.fcnt,
+            )
+        else:
+            _LOGGER.debug("%s: TIME_UNSURE on frame %s; correcting it", device.name, tx.header.fcnt)
+        return True
 
     async def _join(self, tx: Transmission) -> bytes | None:
         """Answer a JOIN (07 section 5.1)."""

@@ -180,3 +180,29 @@ def state_of(hass: HomeAssistant, entity_id: str) -> Any:
     state = hass.states.get(entity_id)
     assert state is not None, entity_id
     return state
+
+
+class Unix:
+    """The server's Unix time, ahead of real time by a settable offset."""
+
+    def __init__(self) -> None:
+        self.offset = 0
+
+    def __call__(self) -> int:
+        return int(time.time()) + self.offset
+
+
+@pytest.fixture
+def unix() -> Generator[Unix]:
+    """Control the server's Unix time (epochs and tags)."""
+    u = Unix()
+    with patch("custom_components.connect_sensors.server._unix", u):
+        yield u
+
+
+async def tick(hass: HomeAssistant) -> None:
+    """Run the server's 5-second tick."""
+    # Firing timers early would also expire in-flight TX_RESULT waits.
+    await asyncio.sleep(0.1)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=6))
+    await hass.async_block_till_done()

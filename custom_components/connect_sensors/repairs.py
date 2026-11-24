@@ -30,7 +30,13 @@ class RePairRepairFlow(RepairsFlow):
         self._dev_eui = dev_eui
 
     async def async_step_init(self, user_input: dict[str, str] | None = None) -> RepairsFlowResult:
-        """Start; user_input here carries only the issue_id."""
+        """Start pairing again, as the Start pairing button does (04 section 4.2), so a
+        device whose pairing expired before the user got here can still pair."""
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is not None and entry.state is ConfigEntryState.LOADED:
+            server = entry.runtime_data
+            if (device := server.devices.get(self._dev_eui)) is not None:
+                server.async_start_pairing(device)
         return await self.async_step_confirm()
 
     async def async_step_confirm(
