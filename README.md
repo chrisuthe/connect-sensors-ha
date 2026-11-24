@@ -9,7 +9,7 @@ It listens for `cs_proxy` nodes on UDP, pairs sensors by their pairing code, and
 their readings into entities. The protocol itself comes from the
 [`connectsensors`](https://pypi.org/project/connectsensors/) package.
 
-**Status:** 0.2.0 adds federation through mailbox servers. Changes by version are in [CHANGELOG.md](CHANGELOG.md). The protocol and this integration are drafts.
+**Status:** 0.2.3. Federation through mailbox servers arrived in 0.2.0; 0.2.2 added the pairing deadline and clock correction; 0.2.3 needs connectsensors 0.4.3. Changes by version are in [CHANGELOG.md](CHANGELOG.md). The protocol and this integration are drafts.
 
 ## Install with HACS
 
