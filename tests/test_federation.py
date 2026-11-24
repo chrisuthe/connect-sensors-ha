@@ -25,7 +25,6 @@ from typing import Any
 from unittest.mock import patch
 
 import connectsensors as cs
-from connectsensors import _csframe as csf
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -670,7 +669,7 @@ async def test_registration_tops_up_and_withdraws(hass: HomeAssistant, homes: Ho
     with patch.object(server_module, "_unix", return_value=later):
         await federation._register(s)
     new_tag = cs.tag_of_pub(cs.ed25519_pub(cs.tag_seed(k_dev_tag, cs.epoch_index(e + 3))))
-    assert any(m[0] == csf.MB_REGISTER for m in sent)
+    assert any(m[0] == cs.MB_REGISTER for m in sent)
     assert new_tag in s.registered
 
     # A new session (re-pairing): the old session's tags are withdrawn.
@@ -681,7 +680,7 @@ async def test_registration_tops_up_and_withdraws(hass: HomeAssistant, homes: Ho
     device = homes.device
     device.set_session(b"\x42" * 16)
     await federation._register(s)
-    withdrawn = {t for m in sent if m[0] == csf.MB_WITHDRAW for t in m[1]}
+    withdrawn = {t for m in sent if m[0] == cs.MB_WITHDRAW for t in m[1]}
     assert old <= withdrawn
     assert not old & set(s.registered)
 

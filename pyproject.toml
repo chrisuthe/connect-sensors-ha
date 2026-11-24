@@ -9,9 +9,9 @@ dependencies = []
 
 [dependency-groups]
 dev = [
-    "connectsensors==0.4.1",
+    "connectsensors==0.4.2",
     # The reference mailbox server (spec 09), run by the federation tests.
-    "cs-mailbox @ git+https://github.com/chrisuthe/ConnectSensors@8f710619d1a33be7050e772bd8c7efc11a84a21d#subdirectory=mailbox",
+    "cs-mailbox @ git+https://github.com/chrisuthe/ConnectSensors@2ea6cee8e5db11f450884c0eaa51c33814f2f2dc#subdirectory=mailbox",
     "mypy==2.4.1",
     "pytest-homeassistant-custom-component==0.13.375",
     "ruff==0.17.6",

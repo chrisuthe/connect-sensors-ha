@@ -867,8 +867,8 @@ dev = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "connectsensors", specifier = "==0.4.1" },
-    { name = "cs-mailbox", git = "https://github.com/chrisuthe/ConnectSensors?subdirectory=mailbox&rev=8f710619d1a33be7050e772bd8c7efc11a84a21d" },
+    { name = "connectsensors", specifier = "==0.4.2" },
+    { name = "cs-mailbox", git = "https://github.com/chrisuthe/ConnectSensors?subdirectory=mailbox&rev=2ea6cee8e5db11f450884c0eaa51c33814f2f2dc" },
     { name = "mypy", specifier = "==2.4.1" },
     { name = "pytest-homeassistant-custom-component", specifier = "==0.13.375" },
     { name = "ruff", specifier = "==0.17.6" },
@@ -876,14 +876,14 @@ dev = [
 
 [[package]]
 name = "connectsensors"
-version = "0.4.1"
+version = "0.4.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fb/85/b0b94a29f5ea188d8338d3c1e258339010189aa0176e71f6ff105b532291/connectsensors-0.4.1.tar.gz", hash = "sha256:57633e66670cf876715ef0c1f89790e0900564278c381ca4ff9479e0d998eae4", size = 42108, upload-time = "2026-11-23T16:10:26.65Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fb/b3/90989ca78b2f44f012c48b30beeb5896c237903d889bc53c75c9af25a35c/connectsensors-0.4.2.tar.gz", hash = "sha256:1f935322bfbfe8d688ebd4bc872653f3b5d806ca7d50d4e24542ab160121e79e", size = 44012, upload-time = "2026-11-24T12:58:01.288Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/00/a9c6d02b309be05beae2a9d9e74e48f9bf66b0a5c7173dce713f72b670b3/connectsensors-0.4.1-py3-none-any.whl", hash = "sha256:a4878febc3dc4ad10eacbb0ae6b21c1e7932e3dca3b125b48fc3c48b05525098", size = 43515, upload-time = "2026-11-23T16:10:25.66Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/8a/20f1c9db36837288dd44c1f9a53ad270a1bdf10e56a7d2e98641cbb859ba/connectsensors-0.4.2-py3-none-any.whl", hash = "sha256:52f4974aeeb822ea236521000888251b67edf1195a418f0e7c8f490744aadc84", size = 45430, upload-time = "2026-11-24T12:57:59.965Z" },
 ]
 
 [[package]]
@@ -1016,7 +1016,7 @@ wheels = [
 [[package]]
 name = "cs-mailbox"
 version = "0.1.0"
-source = { git = "https://github.com/chrisuthe/ConnectSensors?subdirectory=mailbox&rev=8f710619d1a33be7050e772bd8c7efc11a84a21d#8f710619d1a33be7050e772bd8c7efc11a84a21d" }
+source = { git = "https://github.com/chrisuthe/ConnectSensors?subdirectory=mailbox&rev=2ea6cee8e5db11f450884c0eaa51c33814f2f2dc#2ea6cee8e5db11f450884c0eaa51c33814f2f2dc" }
 dependencies = [
     { name = "connectsensors" },
     { name = "cryptography" },
